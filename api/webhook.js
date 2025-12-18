@@ -1,12 +1,11 @@
 const admin = require('firebase-admin');
 
-// Inisialisasi Firebase Admin menggunakan Environment Variables
+// Inisialisasi Firebase
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      // Mengubah string newline (\n) kembali ke format asli key
       privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
     }),
   });
@@ -15,63 +14,65 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 module.exports = async (req, res) => {
-  // Hanya menerima method POST dari Saweria
-  if (req.method !== 'POST') {
-    return res.status(405).json({ error: 'Hanya menerima metode POST' });
-  }
+  // Hanya terima POST dari Saweria
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   try {
     const { amount, donator_name, message } = req.body;
-    
-    // Konversi amount ke angka (Saweria mengirim angka murni)
     const amountPaid = parseInt(amount);
+    
+    console.log(`[PEMBAYARAN] Masuk: Rp ${amountPaid} | Donatur: ${donator_name} | Pesan: ${message}`);
 
-    console.log(`[PAYMENT] Masuk Rp ${amountPaid} dari ${donator_name}`);
-
-    // MENCARI ORDER BERDASARKAN NOMINAL PERSIS (UNIQUE AMOUNT)
-    // Kita mencari di koleksi 'orders' yang statusnya masih 'pending'
     const ordersRef = db.collection('orders');
-    const snapshot = await ordersRef
-      .where('total', '==', amountPaid)
-      .where('status', '==', 'pending')
-      .get();
+    let matchedOrder = null;
 
-    if (snapshot.empty) {
-      console.log(`[FAILED] Tidak ada order pending dengan nominal Rp ${amountPaid}`);
-      // Kita tetap beri respon 200 ke Saweria agar tidak terus-menerus mengirim ulang
-      return res.status(200).json({ 
-        status: 'ignored', 
-        message: 'No matching pending order found for this amount' 
+    // LOGIKA 1: Cari berdasarkan Kode TRX di Pesan (Paling Akurat)
+    // Mencari pola TRX- angka- angka
+    const trxMatch = message ? message.match(/TRX-\d+-\d+/) : null;
+    
+    if (trxMatch) {
+      const orderId = trxMatch[0];
+      const docRef = await ordersRef.doc(orderId).get();
+      if (docRef.exists && docRef.data().status === 'pending') {
+        matchedOrder = { id: orderId, ref: ordersRef.doc(orderId), data: docRef.data() };
+      }
+    }
+
+    // LOGIKA 2: Jika pesan dihapus user, cari berdasarkan Nominal Unik
+    if (!matchedOrder) {
+      const snapshot = await ordersRef.where('status', '==', 'pending').get();
+      snapshot.forEach(doc => {
+        const order = doc.data();
+        // Cek jika nominal pas (toleransi selisih biaya admin bank pembeli max 5000)
+        const selisih = amountPaid - order.total;
+        if (selisih >= 0 && selisih <= 5000) {
+          matchedOrder = { id: doc.id, ref: doc.ref, data: order };
+        }
       });
     }
 
-    // Jika ditemukan pesanan yang cocok (Harusnya hanya 1 karena ada kode unik)
-    const orderDoc = snapshot.docs[0];
-    const orderId = orderDoc.id;
-    const orderData = orderDoc.data();
+    if (matchedOrder) {
+      // OTOMATIS JADIKAN LUNAS
+      await matchedOrder.ref.update({
+        status: 'paid',
+        paymentMethod: 'saweria_auto',
+        verifiedAt: new Date().toISOString(),
+        saweriaData: {
+          donator: donator_name,
+          amount_received: amountPaid,
+          original_bill: matchedOrder.data.total
+        }
+      });
 
-    // UPDATE STATUS JADI PAID
-    await orderDoc.ref.update({
-      status: 'paid',
-      updatedAt: new Date().toISOString(),
-      verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
-      paymentDetail: {
-        source: 'saweria_auto',
-        donator: donator_name,
-        raw_amount: amountPaid
-      }
-    });
+      console.log(`[SUKSES] Pesanan ${matchedOrder.id} LUNAS otomatis.`);
+      return res.status(200).json({ status: 'success', id: matchedOrder.id });
+    }
 
-    console.log(`[SUCCESS] Order ${orderId} otomatis LUNAS!`);
-    
-    return res.status(200).json({ 
-      status: 'success', 
-      order_id: orderId,
-      message: 'Order has been verified and marked as paid' 
-    });
+    console.log(`[PENDING] Tidak ada pesanan yang cocok dengan nominal Rp ${amountPaid}`);
+    return res.status(200).json({ status: 'ignored', reason: 'No matching order' });
 
   } catch (error) {
-    console.error("[ERROR] Webhook Error:", error);
-    return res.status(500).json({ error: 'Terjadi kesalahan internal server' });
+    console.error("Webhook Error:", error);
+    return res.status(500).json({ error: error.message });
   }
 };
