@@ -1,6 +1,5 @@
 const admin = require('firebase-admin');
 
-// Inisialisasi Firebase
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
@@ -14,62 +13,64 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 module.exports = async (req, res) => {
-  // Hanya terima POST dari Saweria
   if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
   try {
     const { amount, donator_name, message } = req.body;
-    const amountPaid = parseInt(amount);
+    const amountPaid = Number(amount);
     
-    console.log(`[PEMBAYARAN] Masuk: Rp ${amountPaid} | Donatur: ${donator_name} | Pesan: ${message}`);
+    console.log(`[PAYMENT] Masuk: Rp ${amountPaid} | Pesan: ${message}`);
 
     const ordersRef = db.collection('orders');
     let matchedOrder = null;
 
-    // LOGIKA 1: Cari berdasarkan Kode TRX di Pesan (Paling Akurat)
-    // Mencari pola TRX- angka- angka
+    // STRATEGI 1: Cari berdasarkan Kode TRX di Pesan (Paling Akurat)
     const trxMatch = message ? message.match(/TRX-\d+-\d+/) : null;
-    
     if (trxMatch) {
       const orderId = trxMatch[0];
-      const docRef = await ordersRef.doc(orderId).get();
-      if (docRef.exists && docRef.data().status === 'pending') {
-        matchedOrder = { id: orderId, ref: ordersRef.doc(orderId), data: docRef.data() };
+      const docSnap = await ordersRef.doc(orderId).get();
+      if (docSnap.exists && docSnap.data().status === 'pending') {
+        matchedOrder = { id: orderId, ref: docSnap.ref, data: docSnap.data() };
       }
     }
 
-    // LOGIKA 2: Jika pesan dihapus user, cari berdasarkan Nominal Unik
+    // STRATEGI 2: Jika pesan dihapus user, cari berdasarkan Nominal yang MENDEKATI
     if (!matchedOrder) {
       const snapshot = await ordersRef.where('status', '==', 'pending').get();
+      
+      let bestMatch = null;
+      let minDiff = 5000; // Toleransi maksimal selisih Rp 5.000 (untuk biaya admin bank)
+
       snapshot.forEach(doc => {
         const order = doc.data();
-        // Cek jika nominal pas (toleransi selisih biaya admin bank pembeli max 5000)
-        const selisih = amountPaid - order.total;
-        if (selisih >= 0 && selisih <= 5000) {
-          matchedOrder = { id: doc.id, ref: doc.ref, data: order };
+        const diff = amountPaid - Number(order.total);
+
+        // Jika uang masuk >= tagihan DAN selisihnya di bawah 5000
+        if (diff >= 0 && diff < minDiff) {
+          minDiff = diff;
+          bestMatch = { id: doc.id, ref: doc.ref, data: order };
         }
       });
+      matchedOrder = bestMatch;
     }
 
     if (matchedOrder) {
-      // OTOMATIS JADIKAN LUNAS
       await matchedOrder.ref.update({
         status: 'paid',
         paymentMethod: 'saweria_auto',
         verifiedAt: new Date().toISOString(),
-        saweriaData: {
-          donator: donator_name,
-          amount_received: amountPaid,
-          original_bill: matchedOrder.data.total
+        saweriaData: { 
+            received: amountPaid, 
+            donator: donator_name,
+            original: matchedOrder.data.total
         }
       });
-
-      console.log(`[SUKSES] Pesanan ${matchedOrder.id} LUNAS otomatis.`);
+      console.log(`[SUKSES] Order ${matchedOrder.id} LUNAS Otomatis!`);
       return res.status(200).json({ status: 'success', id: matchedOrder.id });
     }
 
-    console.log(`[PENDING] Tidak ada pesanan yang cocok dengan nominal Rp ${amountPaid}`);
-    return res.status(200).json({ status: 'ignored', reason: 'No matching order' });
+    console.log(`[FAILED] Tidak ada pesanan yang cocok untuk nominal Rp ${amountPaid}`);
+    return res.status(200).json({ status: 'ignored' });
 
   } catch (error) {
     console.error("Webhook Error:", error);
