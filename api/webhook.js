@@ -1,13 +1,12 @@
 const admin = require('firebase-admin');
 
-// Kita akan mengambil kredensial dari Environment Variables Vercel (Agar Aman)
-// Jangan taruh file JSON asli disini agar tidak dicuri orang di GitHub
+// Inisialisasi Firebase Admin menggunakan Environment Variables
 if (!admin.apps.length) {
   admin.initializeApp({
     credential: admin.credential.cert({
       projectId: process.env.FIREBASE_PROJECT_ID,
       clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      // Trik khusus Vercel: Mengubah \n string menjadi newline asli
+      // Mengubah string newline (\n) kembali ke format asli key
       privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
     }),
   });
@@ -16,61 +15,63 @@ if (!admin.apps.length) {
 const db = admin.firestore();
 
 module.exports = async (req, res) => {
-  // 1. Cek Metode Request (Harus POST dari Saweria)
+  // Hanya menerima method POST dari Saweria
   if (req.method !== 'POST') {
-    return res.status(405).send('Method Not Allowed');
+    return res.status(405).json({ error: 'Hanya menerima metode POST' });
   }
 
   try {
-    const { amount, message, donator_name } = req.body;
+    const { amount, donator_name, message } = req.body;
     
-    console.log(`Saweria masuk: Rp ${amount} dari ${donator_name}. Pesan: ${message}`);
+    // Konversi amount ke angka (Saweria mengirim angka murni)
+    const amountPaid = parseInt(amount);
 
-    // 2. Validasi Pesan (Harus ada Kode TRX)
-    // Asumsi user menulis: "TRX-12345" atau "Bayar TRX-12345"
-    // Kita cari string yang diawali TRX-
-    const trxMatch = message.match(/TRX-\d+-\d+/);
-    
-    if (!trxMatch) {
-      console.log("Tidak ada kode TRX valid di pesan.");
-      return res.status(200).json({ status: 'ignored', reason: 'No TRX code found' });
+    console.log(`[PAYMENT] Masuk Rp ${amountPaid} dari ${donator_name}`);
+
+    // MENCARI ORDER BERDASARKAN NOMINAL PERSIS (UNIQUE AMOUNT)
+    // Kita mencari di koleksi 'orders' yang statusnya masih 'pending'
+    const ordersRef = db.collection('orders');
+    const snapshot = await ordersRef
+      .where('total', '==', amountPaid)
+      .where('status', '==', 'pending')
+      .get();
+
+    if (snapshot.empty) {
+      console.log(`[FAILED] Tidak ada order pending dengan nominal Rp ${amountPaid}`);
+      // Kita tetap beri respon 200 ke Saweria agar tidak terus-menerus mengirim ulang
+      return res.status(200).json({ 
+        status: 'ignored', 
+        message: 'No matching pending order found for this amount' 
+      });
     }
 
-    const orderId = trxMatch[0]; // Contoh: TRX-5821-998
+    // Jika ditemukan pesanan yang cocok (Harusnya hanya 1 karena ada kode unik)
+    const orderDoc = snapshot.docs[0];
+    const orderId = orderDoc.id;
+    const orderData = orderDoc.data();
 
-    // 3. Cari Order di Firebase
-    const orderRef = db.collection('orders').doc(orderId);
-    const docSnap = await orderRef.get();
-
-    if (!docSnap.exists) {
-      console.log(`Order ID ${orderId} tidak ditemukan.`);
-      return res.status(404).json({ status: 'failed', reason: 'Order not found' });
-    }
-
-    const orderData = docSnap.data();
-
-    // 4. Validasi Nominal (Opsional: Cek apakah uang cukup)
-    if (parseInt(amount) < orderData.total) {
-      console.log("Uang kurang.");
-      return res.status(200).json({ status: 'partial', reason: 'Underpaid' });
-    }
-
-    // 5. UPDATE STATUS JADI 'PAID' (LUNAS)
-    await orderRef.update({
+    // UPDATE STATUS JADI PAID
+    await orderDoc.ref.update({
       status: 'paid',
-      paymentMethod: 'saweria_auto',
       updatedAt: new Date().toISOString(),
-      saweriaData: {
+      verifiedAt: admin.firestore.FieldValue.serverTimestamp(),
+      paymentDetail: {
+        source: 'saweria_auto',
         donator: donator_name,
-        amount: amount
+        raw_amount: amountPaid
       }
     });
 
-    console.log(`Sukses! Order ${orderId} lunas.`);
-    return res.status(200).json({ status: 'success', order_id: orderId });
+    console.log(`[SUCCESS] Order ${orderId} otomatis LUNAS!`);
+    
+    return res.status(200).json({ 
+      status: 'success', 
+      order_id: orderId,
+      message: 'Order has been verified and marked as paid' 
+    });
 
   } catch (error) {
-    console.error("Webhook Error:", error);
-    return res.status(500).send('Internal Server Error');
+    console.error("[ERROR] Webhook Error:", error);
+    return res.status(500).json({ error: 'Terjadi kesalahan internal server' });
   }
 };
