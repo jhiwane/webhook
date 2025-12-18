@@ -17,14 +17,14 @@ module.exports = async (req, res) => {
 
   try {
     const { amount, donator_name, message } = req.body;
-    const amountPaid = Number(amount);
+    const amountPaid = parseInt(amount); // Nominal bersih yang diterima Saweria
     
-    console.log(`[PAYMENT] Masuk: Rp ${amountPaid} | Pesan: ${message}`);
+    console.log(`[MASUK] Rp ${amountPaid} | Msg: ${message}`);
 
     const ordersRef = db.collection('orders');
     let matchedOrder = null;
 
-    // STRATEGI 1: Cari berdasarkan Kode TRX di Pesan (Paling Akurat)
+    // 1. CARI BERDASARKAN KODE TRX DI PESAN (Prioritas Utama)
     const trxMatch = message ? message.match(/TRX-\d+-\d+/) : null;
     if (trxMatch) {
       const orderId = trxMatch[0];
@@ -34,20 +34,20 @@ module.exports = async (req, res) => {
       }
     }
 
-    // STRATEGI 2: Jika pesan dihapus user, cari berdasarkan Nominal yang MENDEKATI
+    // 2. CARI BERDASARKAN NOMINAL (Backup jika user hapus pesan)
+    // Toleransi: Uang masuk boleh lebih besar sedikit (maks 5000) dari tagihan
     if (!matchedOrder) {
       const snapshot = await ordersRef.where('status', '==', 'pending').get();
       
       let bestMatch = null;
-      let minDiff = 5000; // Toleransi maksimal selisih Rp 5.000 (untuk biaya admin bank)
-
+      // Cari selisih terkecil
       snapshot.forEach(doc => {
         const order = doc.data();
-        const diff = amountPaid - Number(order.total);
+        const tagihan = parseInt(order.total);
+        const selisih = amountPaid - tagihan;
 
-        // Jika uang masuk >= tagihan DAN selisihnya di bawah 5000
-        if (diff >= 0 && diff < minDiff) {
-          minDiff = diff;
+        // Syarat: Uang Masuk >= Tagihan DAN Selisih <= 5000 Perak
+        if (selisih >= 0 && selisih <= 5000) {
           bestMatch = { id: doc.id, ref: doc.ref, data: order };
         }
       });
@@ -60,20 +60,18 @@ module.exports = async (req, res) => {
         paymentMethod: 'saweria_auto',
         verifiedAt: new Date().toISOString(),
         saweriaData: { 
-            received: amountPaid, 
-            donator: donator_name,
-            original: matchedOrder.data.total
+            amount_received: amountPaid, 
+            donator: donator_name
         }
       });
-      console.log(`[SUKSES] Order ${matchedOrder.id} LUNAS Otomatis!`);
+      console.log(`[LUNAS] Order ${matchedOrder.id}`);
       return res.status(200).json({ status: 'success', id: matchedOrder.id });
     }
 
-    console.log(`[FAILED] Tidak ada pesanan yang cocok untuk nominal Rp ${amountPaid}`);
-    return res.status(200).json({ status: 'ignored' });
+    return res.status(200).json({ status: 'ignored', msg: 'No match found' });
 
   } catch (error) {
-    console.error("Webhook Error:", error);
-    return res.status(500).json({ error: error.message });
+    console.error(error);
+    return res.status(500).send('Server Error');
   }
 };
