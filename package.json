@@ -1,7 +1,8 @@
 {
-  "name": "saweria-firebase-webhook",
+  "name": "saweria-webhook-handler",
   "version": "1.0.0",
+  "main": "api/webhook.js",
   "dependencies": {
-    "firebase-admin": "^11.11.0"
+    "firebase-admin": "^12.0.0"
   }
 }
