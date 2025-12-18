@@ -1,8 +1,8 @@
 {
-  "name": "saweria-webhook-handler",
+  "name": "jisaeshin-backend",
   "version": "1.0.0",
-  "main": "api/webhook.js",
   "dependencies": {
-    "firebase-admin": "^12.0.0"
+    "firebase-admin": "^12.0.0",
+    "midtrans-client": "^1.3.1"
   }
 }
