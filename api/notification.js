@@ -1,27 +1,26 @@
 const admin = require('firebase-admin');
 const midtransClient = require('midtrans-client');
 
-// 1. Inisialisasi Firebase Admin
+// 1. Inisialisasi Firebase Admin (MENGGUNAKAN JSON FULL)
 if (!admin.apps.length) {
-  admin.initializeApp({
-    credential: admin.credential.cert({
-      projectId: process.env.FIREBASE_PROJECT_ID,
-      clientEmail: process.env.FIREBASE_CLIENT_EMAIL,
-      privateKey: process.env.FIREBASE_PRIVATE_KEY.replace(/\\n/g, '\n'),
-    }),
-  });
+    // Parsing JSON dari Environment Variable Vercel
+    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+    
+    admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount),
+    });
 }
 const db = admin.firestore();
 
-// 2. Inisialisasi Midtrans Core API (Untuk Verifikasi Signature)
+// 2. Inisialisasi Midtrans Core API
 const apiClient = new midtransClient.CoreApi({
-    isProduction: true, // Pastikan ini true untuk Production
-    serverKey: process.env.MIDTRANS_SERVER_KEY,
-    clientKey: process.env.MIDTRANS_CLIENT_KEY
+    isProduction: true, 
+    serverKey: process.env.MIDTRANS_SERVER_KEY, // Pastikan Variable ini ada di Vercel!
+    clientKey: process.env.MIDTRANS_CLIENT_KEY  // Pastikan Variable ini ada di Vercel!
 });
 
 module.exports = async (req, res) => {
-    // Handle CORS (Penting untuk webhook)
+    // Handle CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST');
 
@@ -30,46 +29,51 @@ module.exports = async (req, res) => {
     try {
         const notificationJson = req.body;
 
-        // Cek status transaksi ke Server Midtrans (Verifikasi Keamanan)
+        // Cek status transaksi ke Server Midtrans
         const statusResponse = await apiClient.transaction.notification(notificationJson);
         const orderId = statusResponse.order_id;
         const transactionStatus = statusResponse.transaction_status;
         const fraudStatus = statusResponse.fraud_status;
+        const grossAmount = parseFloat(statusResponse.gross_amount); // Uang yang masuk
 
-        console.log(`[MIDTRANS LOG] ${orderId} | Status: ${transactionStatus} | Fraud: ${fraudStatus}`);
+        console.log(`[MIDTRANS] ${orderId} | Status: ${transactionStatus} | Amount: ${grossAmount}`);
 
-        // Referensi Dokumen Order di Firebase
         const orderRef = db.collection('orders').doc(orderId);
+        
+        // --- 🛡️ FITUR KEAMANAN BARU (ANTI HACK RP 1) ---
+        const orderDoc = await orderRef.get();
+        if (!orderDoc.exists) {
+             return res.status(404).send('Order Not Found in DB');
+        }
 
-        // Logika Status Midtrans -> Firebase Status
+        const realTotal = parseFloat(orderDoc.data().total); // Harga asli di Database
+
+        // Jika uang yang dibayar LEBIH KECIL dari harga asli (Toleransi 100 perak)
+        if (grossAmount < (realTotal - 100)) {
+            console.error(`🚨 FRAUD DETECTED! Order: ${orderId}, Paid: ${grossAmount}, Real: ${realTotal}`);
+            await orderRef.update({ 
+                status: 'fraud_attempt',
+                adminMessage: `SYSTEM ALERT: Pembayaran Rp ${grossAmount} tidak sesuai tagihan Rp ${realTotal}. JANGAN PROSES!`
+            });
+            return res.status(200).json({ status: 'fraud_detected' });
+        }
+        // ---------------------------------------------------
+
+        // Logika Update Status Normal
         if (transactionStatus == 'capture') {
             if (fraudStatus == 'challenge') {
-                // Transaksi ditahan/perlu review
                 await orderRef.update({ status: 'pending_review' });
             } else if (fraudStatus == 'accept') {
-                // Transaksi Kartu Kredit Sukses
-                await orderRef.update({ 
-                    status: 'paid', 
-                    verifiedAt: new Date().toISOString(),
-                    paymentMethod: 'credit_card'
-                });
+                await orderRef.update({ status: 'paid', verifiedAt: new Date().toISOString() });
             }
         } else if (transactionStatus == 'settlement') {
-            // Transaksi Sukses (QRIS, VA, Gopay, dll)
-            await orderRef.update({ 
-                status: 'paid', 
-                verifiedAt: new Date().toISOString(),
-                paymentMethod: statusResponse.payment_type 
-            });
+            await orderRef.update({ status: 'paid', verifiedAt: new Date().toISOString() });
         } else if (transactionStatus == 'cancel' || transactionStatus == 'deny' || transactionStatus == 'expire') {
-            // Transaksi Gagal/Kadaluarsa
             await orderRef.update({ status: 'failed' });
         } else if (transactionStatus == 'pending') {
-            // Menunggu Pembayaran
             await orderRef.update({ status: 'pending_payment' });
         }
 
-        // Wajib return 200 OK ke Midtrans
         return res.status(200).json({ status: 'ok' });
 
     } catch (error) {
