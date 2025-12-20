@@ -1,62 +1,58 @@
+// api/token.js
 const midtransClient = require('midtrans-client');
 
-// Inisialisasi Snap (Mode Production)
-const snap = new midtransClient.Snap({
-    isProduction: true, // Pastikan ini true untuk Production
-    serverKey: process.env.MIDTRANS_SERVER_KEY,
-    clientKey: process.env.MIDTRANS_CLIENT_KEY
-});
+export default async function handler(req, res) {
+  // 1. Keamanan CORS (Hanya izinkan web kamu)
+  res.setHeader('Access-Control-Allow-Origin', '*'); // Ubah ke domain aslimu saat production
+  res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-module.exports = async (req, res) => {
-    // Setup CORS agar bisa diakses dari domain mana saja
-    res.setHeader('Access-Control-Allow-Credentials', true);
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
-    // Handle Preflight Request
-    if (req.method === 'OPTIONS') {
-        res.status(200).end();
-        return;
+  try {
+    const { order_id, total, items } = req.body;
+
+    // 2. Setup Midtrans
+    const snap = new midtransClient.Snap({
+      isProduction: true, // Ubah false jika testing Sandbox
+      serverKey: process.env.MIDTRANS_SERVER_KEY,
+    });
+
+    // 3. Deteksi Item API (VIP Reseller / Digiflazz)
+    // Kita cari item yang processType-nya 'EXTERNAL_API'
+    const apiItem = items.find(i => i.processType === 'EXTERNAL_API');
+    
+    // 4. Bungkus Data Penting ke Metadata Midtrans
+    // Agar saat notifikasi balik, kita tahu harus kirim ke mana
+    let customPayload = null;
+    if (apiItem) {
+      customPayload = JSON.stringify({
+        target_url: apiItem.serverRoute,   // URL VIP
+        service_code: apiItem.serviceCode, // Kode Barang (ML86)
+        target_data: apiItem.data ? apiItem.data[0] : null, // ID Player / No HP
+        is_api: true
+      });
     }
 
-    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+    // 5. Buat Transaksi
+    const parameter = {
+      transaction_details: { order_id: order_id, gross_amount: total },
+      item_details: items.map(item => ({
+        id: Math.random().toString(36).substring(7),
+        price: item.price,
+        quantity: item.qty,
+        name: item.name.substring(0, 50).replace(/[^\w\s]/gi, '')
+      })),
+      custom_field1: customPayload, // <--- Data Titipan Disimpan Disini
+      credit_card: { secure: true }
+    };
 
-    try {
-        const { order_id, total, items, customer_details } = req.body;
+    const transaction = await snap.createTransaction(parameter);
+    res.status(200).json({ token: transaction.token });
 
-        // Parameter Transaksi Standar Midtrans
-        const parameter = {
-            transaction_details: {
-                order_id: order_id,
-                gross_amount: parseInt(total)
-            },
-            credit_card: {
-                secure: true
-            },
-            // Detail Item (Opsional tapi bagus untuk struk user)
-            item_details: items.map(item => ({
-                id: "ITEM",
-                price: parseInt(item.price),
-                quantity: parseInt(item.qty),
-                name: item.name.substring(0, 49) // Midtrans batasi nama item max 50 char
-            })),
-            // Data Customer (Dummy/Default agar tidak error)
-            customer_details: {
-                first_name: "Customer",
-                email: "customer@jisaeshin.store",
-                phone: "08123456789"
-            }
-        };
-
-        // Minta Token ke Midtrans
-        const transaction = await snap.createTransaction(parameter);
-        
-        // Kirim Token ke Frontend
-        res.status(200).json({ token: transaction.token });
-
-    } catch (error) {
-        console.error("Midtrans Token Error:", error);
-        res.status(500).json({ error: error.message });
-    }
-};
+  } catch (error) {
+    console.error("Token Error:", error);
+    res.status(500).json({ error: "System Busy" });
+  }
+}
