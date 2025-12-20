@@ -1,83 +1,102 @@
-const admin = require('firebase-admin');
+// api/notification.js
 const midtransClient = require('midtrans-client');
+const axios = require('axios');
+const crypto = require('crypto'); // Security Native
+const cryptoJS = require('crypto-js'); // MD5 VIP
+const { db } = require('../lib/firebase'); // Panggil Kunci Database
 
-// 1. Inisialisasi Firebase Admin (MENGGUNAKAN JSON FULL)
-if (!admin.apps.length) {
-    // Parsing JSON dari Environment Variable Vercel
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    
-    admin.initializeApp({
-        credential: admin.credential.cert(serviceAccount),
-    });
-}
-const db = admin.firestore();
+export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'POST');
 
-// 2. Inisialisasi Midtrans Core API
-const apiClient = new midtransClient.CoreApi({
-    isProduction: true, 
-    serverKey: process.env.MIDTRANS_SERVER_KEY, // Pastikan Variable ini ada di Vercel!
-    clientKey: process.env.MIDTRANS_CLIENT_KEY  // Pastikan Variable ini ada di Vercel!
-});
+  if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
 
-module.exports = async (req, res) => {
-    // Handle CORS
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST');
+  try {
+    const notificationJson = req.body;
+    const { order_id, status_code, gross_amount, signature_key, transaction_status, fraud_status, custom_field1 } = notificationJson;
 
-    if (req.method !== 'POST') return res.status(405).send('Method Not Allowed');
+    // --- LEVEL 1: VERIFIKASI KEAMANAN (ANTI HACK) ---
+    const serverKey = process.env.MIDTRANS_SERVER_KEY;
+    const inputString = order_id + status_code + gross_amount + serverKey;
+    const mySignature = crypto.createHash('sha512').update(inputString).digest('hex');
 
-    try {
-        const notificationJson = req.body;
-
-        // Cek status transaksi ke Server Midtrans
-        const statusResponse = await apiClient.transaction.notification(notificationJson);
-        const orderId = statusResponse.order_id;
-        const transactionStatus = statusResponse.transaction_status;
-        const fraudStatus = statusResponse.fraud_status;
-        const grossAmount = parseFloat(statusResponse.gross_amount); // Uang yang masuk
-
-        console.log(`[MIDTRANS] ${orderId} | Status: ${transactionStatus} | Amount: ${grossAmount}`);
-
-        const orderRef = db.collection('orders').doc(orderId);
-        
-        // --- 🛡️ FITUR KEAMANAN BARU (ANTI HACK RP 1) ---
-        const orderDoc = await orderRef.get();
-        if (!orderDoc.exists) {
-             return res.status(404).send('Order Not Found in DB');
-        }
-
-        const realTotal = parseFloat(orderDoc.data().total); // Harga asli di Database
-
-        // Jika uang yang dibayar LEBIH KECIL dari harga asli (Toleransi 100 perak)
-        if (grossAmount < (realTotal - 100)) {
-            console.error(`🚨 FRAUD DETECTED! Order: ${orderId}, Paid: ${grossAmount}, Real: ${realTotal}`);
-            await orderRef.update({ 
-                status: 'fraud_attempt',
-                adminMessage: `SYSTEM ALERT: Pembayaran Rp ${grossAmount} tidak sesuai tagihan Rp ${realTotal}. JANGAN PROSES!`
-            });
-            return res.status(200).json({ status: 'fraud_detected' });
-        }
-        // ---------------------------------------------------
-
-        // Logika Update Status Normal
-        if (transactionStatus == 'capture') {
-            if (fraudStatus == 'challenge') {
-                await orderRef.update({ status: 'pending_review' });
-            } else if (fraudStatus == 'accept') {
-                await orderRef.update({ status: 'paid', verifiedAt: new Date().toISOString() });
-            }
-        } else if (transactionStatus == 'settlement') {
-            await orderRef.update({ status: 'paid', verifiedAt: new Date().toISOString() });
-        } else if (transactionStatus == 'cancel' || transactionStatus == 'deny' || transactionStatus == 'expire') {
-            await orderRef.update({ status: 'failed' });
-        } else if (transactionStatus == 'pending') {
-            await orderRef.update({ status: 'pending_payment' });
-        }
-
-        return res.status(200).json({ status: 'ok' });
-
-    } catch (error) {
-        console.error("Webhook Error:", error);
-        return res.status(500).send('Internal Server Error');
+    if (signature_key !== mySignature) {
+      console.warn(`🚨 FAKE NOTIFICATION BLOCKED: ${order_id}`);
+      return res.status(403).json({ message: "Invalid Signature" });
     }
-};
+
+    console.log(`✅ Valid Notif: ${order_id} | Status: ${transaction_status}`);
+
+    // --- LEVEL 2: UPDATE FIREBASE ---
+    const orderRef = db.collection('orders').doc(order_id);
+
+    let newStatus = 'pending';
+    if (transaction_status == 'capture' || transaction_status == 'settlement') {
+      newStatus = 'paid';
+    } else if (transaction_status == 'cancel' || transaction_status == 'expire') {
+      newStatus = 'failed';
+    }
+
+    // Update status dasar dulu ke Firebase
+    await orderRef.update({ 
+        status: newStatus,
+        last_updated: new Date().toISOString()
+    });
+
+    // --- LEVEL 3: EKSEKUSI API MITRA (JIKA PAID) ---
+    if (newStatus === 'paid' && custom_field1) {
+      try {
+        const apiData = JSON.parse(custom_field1);
+
+        // Cek apakah ini produk otomatis (VIP/Digi)
+        if (apiData.is_api && apiData.target_url) {
+            
+            console.log(`🚀 AUTO PROCESS: ${apiData.service_code} -> ${apiData.target_data}`);
+            
+            // A. LOGIKA VIP RESELLER
+            if (apiData.target_url.includes('vip-reseller')) {
+                const vipId = process.env.VIP_API_ID;
+                const vipKey = process.env.VIP_API_KEY;
+                const sign = cryptoJS.MD5(vipId + vipKey).toString();
+
+                const formData = new URLSearchParams();
+                formData.append('key', vipKey);
+                formData.append('sign', sign);
+                formData.append('type', 'order');
+                formData.append('service', apiData.service_code);
+                formData.append('data_no', apiData.target_data);
+
+                // TEMBAK!
+                const vipRes = await axios.post(apiData.target_url, formData);
+                console.log("VIP RESPONSE:", vipRes.data);
+
+                // Update Firebase dengan pesan dari VIP
+                // VIP biasanya mengembalikan { result: true, data: { trxid: '...', message: '...' } }
+                if(vipRes.data && vipRes.data.result) {
+                    await orderRef.update({
+                        adminMessage: `AUTO SUCCESS! TRX ID: ${vipRes.data.data.trxid}\n${vipRes.data.message}`,
+                        status: 'completed' // Tandai selesai otomatis
+                    });
+                } else {
+                    await orderRef.update({
+                        adminMessage: `AUTO FAILED: ${vipRes.data.message}`,
+                        status: 'manual_check' // Biar admin cek manual
+                    });
+                }
+            }
+            // B. LOGIKA DIGIFLAZZ (Future Proof)
+            // Bisa ditambahkan disini nanti...
+        }
+      } catch (err) {
+        console.error("Auto Process Failed:", err.message);
+        await orderRef.update({ adminMessage: "SYSTEM ERROR: Auto process failed. Checking manual." });
+      }
+    }
+
+    return res.status(200).send('OK');
+
+  } catch (e) {
+    console.error("Backend Error:", e);
+    return res.status(500).send('Internal Server Error');
+  }
+}
