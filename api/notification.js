@@ -1,9 +1,9 @@
-// api/notification.js (V58 - FINAL: SMART DATA & PROXY)
+// api/notification.js (V60 - ULTIMATE: MANUAL NOTIF, PROXY, SECURE DATA)
 const midtransClient = require('midtrans-client');
 const axios = require('axios');
 const crypto = require('crypto');
 const cryptoJS = require('crypto-js');
-// Pastikan path firebase ini sesuai dengan struktur folder project Vercel kamu
+// Pastikan path ini benar sesuai struktur folder Vercel Anda
 const { db } = require('../lib/firebase'); 
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
@@ -12,6 +12,7 @@ async function sendTelegramAlert(message) {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
     
+    // Validasi token agar tidak crash jika env belum diisi
     if (!token || !chatId) return; 
 
     try {
@@ -55,16 +56,19 @@ export default async function handler(req, res) {
     // Update status dasar dulu agar user tahu pembayaran masuk
     await orderRef.update({ status: newStatus, last_updated: new Date().toISOString() });
 
-    // 3. LOGIKA EKSEKUSI KE VIP RESELLER (Hanya jika Status PAID)
+    // 3. LOGIKA EKSEKUSI (Hanya jika Status PAID)
     if (newStatus === 'paid' && custom_field1) {
       try {
         const apiData = JSON.parse(custom_field1);
 
-        // Pastikan ini transaksi otomatis (API)
+        // ==========================================
+        // CABANG LOGIKA: API (AUTO) VS MANUAL
+        // ==========================================
+
         if (apiData.is_api && apiData.target_url) {
+            // ---> KASUS 1: PRODUK API / OTOMATIS (VIP RESELLER)
             
             // A. LOGIKA PEMBERSIH NOMOR (Smart ID)
-            // Memisahkan Zone ID jika ada (contoh: 12345 (6789))
             let cleanDataNo = apiData.target_data;
             let cleanZone = '';
             if (cleanDataNo.includes('(') || cleanDataNo.includes(' ')) {
@@ -83,7 +87,6 @@ export default async function handler(req, res) {
             // Ambil list proxy dari ENV, pisahkan dengan koma
             const proxyList = process.env.PROXY_URL ? process.env.PROXY_URL.split(',') : [null];
             
-            // Loop untuk mencoba proxy satu per satu jika gagal
             for (let i = 0; i < proxyList.length; i++) {
                 if (isSuccess) break; // Jika sudah sukses, berhenti loop
                 
@@ -94,12 +97,12 @@ export default async function handler(req, res) {
                     // Config Axios dengan Proxy
                     let axiosConfig = { 
                         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                        timeout: 30000 // 30 Detik timeout (VIP kadang lambat)
+                        timeout: 30000 // 30 Detik timeout
                     };
 
                     if (currentProxy) {
                         axiosConfig.httpsAgent = new HttpsProxyAgent(currentProxy);
-                        axiosConfig.proxy = false; // Disable default proxy axios
+                        axiosConfig.proxy = false; 
                     }
 
                     // Cek Provider (VIP Reseller)
@@ -124,38 +127,33 @@ export default async function handler(req, res) {
                             isSuccess = true;
                             const resData = vipRes.data.data;
 
-                            // >>> FITUR KUNCI: AMBIL DATA SN / NOTE (Bukan Cuma TRXID) <<<
-                            // Prioritas: SN > Note > TrxID
-                            // Ini agar email/pass Canva terbaca dan masuk ke adminMessage
+                            // >>> SMART DATA CAPTURE (Prioritas SN > Note > TRXID) <<<
                             let contentData = resData.sn || resData.note || resData.trxid || "Data terkirim";
-                            
-                            // Bersihkan jika ada kata "Sukses" berulang dari provider
                             contentData = contentData.replace(/^Sukses\s+/i, '');
 
-                            // Update ke Firebase
-                            // Format ini akan dibaca oleh cleanSnMessage di Frontend V56
+                            // Update ke Firebase (Data ini dibaca Frontend V56)
                             await orderRef.update({ 
                                 adminMessage: `✅ SUKSES via ${attemptLog}! SN: ${contentData}`, 
                                 status: 'completed' 
                             });
 
-                            // KIRIM TELEGRAM KE ADMIN (Lengkap dengan data)
+                            // TELEGRAM: Notif Sukses API
                             await sendTelegramAlert(
-                                `💰 <b>ORDER SUKSES!</b>\n` +
+                                `🤖 <b>ORDER AUTO SUKSES!</b>\n` +
                                 `Order ID: <code>${order_id}</code>\n` +
                                 `Produk: ${apiData.service_code}\n` +
-                                `Status: <b>TERKIRIM</b>\n` +
+                                `Tujuan: ${cleanDataNo}\n` +
                                 `---------------------------\n` +
                                 `<b>DATA / SN:</b>\n<code>${contentData}</code>\n` +
                                 `---------------------------\n` +
-                                `Via: ${attemptLog}`
+                                `Rp ${gross_amount}`
                             );
                         } else {
-                            // Tangani Error dari VIP (Saldo habis, Gangguan, dll)
+                            // Tangani Error dari VIP
                             lastErrorMsg = vipRes.data.message;
                             console.warn(`VIP Error (${attemptLog}):`, lastErrorMsg);
                             
-                            // Jika errornya bukan masalah koneksi (misal Saldo Habis), jangan coba proxy lain, percuma.
+                            // Jika error Saldo/Produk, stop proxy loop
                             if(lastErrorMsg.toLowerCase().includes('saldo') || lastErrorMsg.toLowerCase().includes('produk')) break; 
                         }
                     }
@@ -169,17 +167,35 @@ export default async function handler(req, res) {
             if (!isSuccess) {
                 await orderRef.update({ adminMessage: `❌ GAGAL. Pesan Provider: ${lastErrorMsg}`, status: 'manual_check' });
                 
-                // Alert Admin untuk Cek Manual
+                // TELEGRAM: Notif Gagal API
                 await sendTelegramAlert(
-                    `⚠️ <b>ORDER GAGAL (PROSES MANUAL)</b>\n` +
+                    `⚠️ <b>ORDER AUTO GAGAL!</b>\n` +
                     `Order ID: <code>${order_id}</code>\n` +
                     `Produk: ${apiData.service_code}\n` +
-                    `Tujuan: ${cleanDataNo} ${cleanZone}\n` +
-                    `Error: ${lastErrorMsg}\n\n` +
-                    `<i>Silakan proses manual lewat web provider!</i>`
+                    `Error: ${lastErrorMsg}\n` +
+                    `<i>Silakan cek manual!</i>`
                 );
             }
+
+        } else {
+            // ---> KASUS 2: PRODUK MANUAL (INI YANG ANDA MINTA!)
+            // Code ini jalan jika produk diset MANUAL di Admin Panel
+            
+            await orderRef.update({ adminMessage: "📦 Order Manual Lunas. Menunggu proses admin..." });
+
+            // TELEGRAM: Notif Order Manual Masuk
+            await sendTelegramAlert(
+                `📦 <b>ORDER MANUAL MASUK!</b>\n` +
+                `---------------------------\n` +
+                `Order ID: <code>${order_id}</code>\n` +
+                `Item: <b>${apiData.name || 'Produk Manual'}</b>\n` +
+                `Data User: <code>${apiData.target_data || '-'}</code>\n` +
+                `Nominal: Rp ${gross_amount}\n` +
+                `---------------------------\n` +
+                `⚡ <b>UANG SUDAH MASUK, SEGERA PROSES!</b>`
+            );
         }
+
       } catch (err) {
         console.error("System Crash:", err);
         await orderRef.update({ status: 'manual_check', adminMessage: "System Backend Error" });
