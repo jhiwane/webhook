@@ -1,32 +1,33 @@
-// api/notification.js (V64 - DEBUGGER & ANTI-SILENT)
+// api/notification.js (V65 - INSTANT NOTIFICATION FIRST)
 const midtransClient = require('midtrans-client');
 const axios = require('axios');
 const crypto = require('crypto');
-// const cryptoJS = require('crypto-js'); // Opsional, nyalakan jika perlu sign MD5
 const { db } = require('../lib/firebase'); 
 const { HttpsProxyAgent } = require('https-proxy-agent');
 
-// --- FUNGSI TELEGRAM (ANTI ERROR) ---
-async function sendTelegramAlert(message, useHtml = true) {
+// --- FUNGSI KIRIM TELEGRAM (ANTI GAGAL) ---
+async function sendTelegramAlert(message) {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
     
-    if (!token || !chatId) return console.error("❌ Token/ChatID Kosong!");
+    // Jangan biarkan script mati cuma gara-gara token kosong
+    if (!token || !chatId) {
+        console.error("❌ Telegram Config Missing");
+        return; 
+    }
 
     try {
-        const payload = {
+        await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
             chat_id: chatId, 
-            text: message
-        };
-        if (useHtml) payload.parse_mode = 'HTML';
-
-        await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, payload);
+            text: message,
+            parse_mode: 'HTML'
+        });
+        console.log("✅ Telegram Sent!");
     } catch (e) { 
-        console.error("Gagal kirim Tele:", e.message); 
+        console.error("Gagal Tele:", e.message); 
     }
 }
 
-// --- HANDLER UTAMA ---
 export default async function handler(req, res) {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Methods', 'POST');
@@ -37,99 +38,151 @@ export default async function handler(req, res) {
     const notificationJson = req.body;
     const { order_id, status_code, gross_amount, signature_key, transaction_status, custom_field1 } = notificationJson;
 
-    // 1. VALIDASI KEAMANAN
+    // 1. CEK STATUS BAYAR (SEDERHANA)
+    let isPaid = false;
+    if (transaction_status == 'capture' || transaction_status == 'settlement') isPaid = true;
+    
+    // Jika belum lunas, update DB saja dan stop.
+    if (!isPaid) {
+        let status = (transaction_status == 'cancel' || transaction_status == 'expire') ? 'failed' : 'pending';
+        await db.collection('orders').doc(order_id).update({ status: status });
+        return res.status(200).send('OK');
+    }
+
+    // 2. VALIDASI SIGNATURE (WAJIB DEMI KEAMANAN)
     const serverKey = process.env.MIDTRANS_SERVER_KEY;
     const inputString = order_id + status_code + gross_amount + serverKey;
     const mySignature = crypto.createHash('sha512').update(inputString).digest('hex');
 
     if (signature_key !== mySignature) {
-       await sendTelegramAlert(`🚨 <b>BAHAYA:</b> Hack Signature di ID: ${order_id}`);
+       await sendTelegramAlert(`🚨 <b>HACK DETECTED!</b> ID: ${order_id}`);
        return res.status(403).json({ message: "Invalid Signature" });
     }
 
-    // 2. CEK STATUS
-    let newStatus = 'pending';
-    if (transaction_status == 'capture' || transaction_status == 'settlement') newStatus = 'paid';
-    else if (transaction_status == 'cancel' || transaction_status == 'expire') newStatus = 'failed';
+    // ============================================================
+    // 3. ZONA NOTIFIKASI INSTAN (V65)
+    // Apapun yang terjadi di bawah, Pesan ini WAJIB TERKIRIM DULUAN
+    // ============================================================
+    
+    // Coba ambil nama barang dari Firebase dulu biar notifnya cantik
+    let itemName = "Produk Manual/Unknown";
+    let buyerData = "Cek Dashboard";
+    let isApi = false;
+    let apiData = null;
 
-    const orderRef = db.collection('orders').doc(order_id);
-    await orderRef.update({ status: newStatus, last_updated: new Date().toISOString() });
-
-    // 3. LOGIKA EKSEKUSI (KHUSUS PAID)
-    if (newStatus === 'paid') {
+    try {
+        const orderSnap = await db.collection('orders').doc(order_id).get();
+        if (orderSnap.exists) {
+            const data = orderSnap.data();
+            if (data.items && data.items.length > 0) {
+                itemName = data.items[0].name;
+                buyerData = data.items[0].note || "-";
+                // Cek tipe dari database langsung
+                if (data.items[0].processType === 'EXTERNAL_API') isApi = true;
+            }
+        }
         
-        // [DEBUG V64] KIRIM SINYAL PERTAMA (Tanpa Logika)
-        // Jika pesan ini masuk, berarti Midtrans & Bot AMAN.
-        await sendTelegramAlert(`🔔 <b>Pembayaran Masuk!</b>\nID: ${order_id}\nRp ${gross_amount}\n<i>Memproses data...</i>`);
+        // Cek juga dari custom_field1 sebagai backup
+        if (custom_field1) {
+            apiData = JSON.parse(custom_field1);
+            if (apiData.is_api) isApi = true;
+        }
+    } catch (e) {
+        console.log("Gagal baca detail order, kirim notif basic aja.");
+    }
 
-        try {
-            // Ambil Data Order
-            const orderSnap = await orderRef.get();
-            if (!orderSnap.exists) throw new Error("Data Order tidak ditemukan di Firebase");
+    // ---> KIRIM TELEGRAM SEKARANG! (Jangan tunggu proxy/vip) <---
+    await sendTelegramAlert(
+        `💰 <b>UANG MASUK BOS!</b>\n` +
+        `---------------------------\n` +
+        `ID: <code>${order_id}</code>\n` +
+        `Item: <b>${itemName}</b>\n` +
+        `Data: <code>${buyerData}</code>\n` +
+        `Rp ${gross_amount}\n` +
+        `---------------------------\n` +
+        `<i>Status: ${isApi ? 'Memproses Otomatis...' : '⚡ MANUAL (PROSES SEKARANG!)'}</i>`
+    );
+
+    // ============================================================
+    // 4. UPDATE DATABASE & EKSEKUSI API (BARU JALAN SETELAH NOTIF)
+    // ============================================================
+    
+    const orderRef = db.collection('orders').doc(order_id);
+    await orderRef.update({ status: 'paid', last_updated: new Date().toISOString() });
+
+    // HANYA JIKA API, KITA JALANKAN LOGIKA RIBET (PROXY DLL)
+    if (isApi && apiData && apiData.target_url) {
+        
+        await orderRef.update({ adminMessage: "🤖 Memproses API Otomatis..." });
+
+        let isSuccess = false;
+        let lastError = "";
+        
+        // Logic Proxy Singkat & Padat
+        const proxyList = process.env.PROXY_URL ? process.env.PROXY_URL.split(',') : [null];
+        
+        // Bersihkan ID Pelanggan
+        let cleanDataNo = apiData.target_data;
+        let cleanZone = '';
+        if (cleanDataNo.includes('(')) {
+            const parts = cleanDataNo.replace(/[()]/g, ' ').trim().split(/\s+/);
+            if (parts.length >= 2) { cleanDataNo = parts[0]; cleanZone = parts[1]; }
+        }
+
+        for (let i = 0; i < proxyList.length; i++) {
+            if (isSuccess) break;
+            const currentProxy = proxyList[i] ? proxyList[i].trim() : null;
             
-            const orderData = orderSnap.data();
-            const mainItem = orderData.items?.[0] || { name: 'Unknown Item', processType: 'MANUAL' };
-            const userNote = mainItem.note || '-';
-            
-            // Cek Tipe: API atau MANUAL
-            const isProcessApi = mainItem.processType === 'EXTERNAL_API';
-
-            // --- JALUR OTOMATIS (API) ---
-            if (isProcessApi) {
-                let apiData = null;
-                try { apiData = JSON.parse(custom_field1); } catch(e) {}
-
-                // Jika data API rusak, JANGAN ERROR, tapi pindah ke Manual
-                if (!apiData || !apiData.target_url) {
-                    throw new Error("Data API (custom_field1) tidak valid, alihkan ke Manual.");
+            try {
+                let axiosConfig = { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 25000 };
+                if (currentProxy) {
+                    axiosConfig.httpsAgent = new HttpsProxyAgent(currentProxy);
+                    axiosConfig.proxy = false;
                 }
 
-                // ... (Logika Proxy VIP Reseller Disini - Dipersingkat agar tidak error syntax) ...
-                // Anda bisa paste logika proxy V60 disini jika perlu, 
-                // TAPI saran saya tes dulu tanpa proxy kompleks di V64 ini untuk memastikan notif jalan.
-                
-                // SEMENTARA KITA BUAT SIMPLE UNTUK TES V64:
-                // Jika ingin full proxy, replace blok ini dengan V60 nanti setelah V64 sukses.
-                await orderRef.update({ adminMessage: "⚠️ Fitur API sedang maintenance, cek manual." });
-                throw new Error("Mode Debug: Paksa pindah ke notif Manual untuk tes.");
+                // VIP Reseller Logic
+                const vipId = process.env.VIP_API_ID;
+                const vipKey = process.env.VIP_API_KEY;
+                const sign = cryptoJS.MD5(vipId + vipKey).toString();
+                const formData = new URLSearchParams();
+                formData.append('key', vipKey);
+                formData.append('sign', sign);
+                formData.append('type', 'order');
+                formData.append('service', apiData.service_code);
+                formData.append('data_no', cleanDataNo);
+                if(cleanZone) formData.append('data_zone', cleanZone);
 
-            } 
-            
-            // --- JALUR MANUAL (ATAU JIKA API GAGAL) ---
-            else {
-                // Notif Manual
-                await orderRef.update({ adminMessage: "📦 Order Manual Lunas. Menunggu proses..." });
+                const vipRes = await axios.post(apiData.target_url, formData, axiosConfig);
 
-                await sendTelegramAlert(
-                    `📦 <b>ORDER MANUAL / CEK ADMIN</b>\n` +
-                    `---------------------------\n` +
-                    `Order ID: <code>${order_id}</code>\n` +
-                    `Item: <b>${mainItem.name}</b>\n` +
-                    `Data User: <code>${userNote}</code>\n` +
-                    `Nominal: Rp ${gross_amount}\n` +
-                    `---------------------------\n` +
-                    `⚡ <b>UANG SUDAH MASUK!</b>`
-                );
+                if(vipRes.data && vipRes.data.result) {
+                    isSuccess = true;
+                    let sn = vipRes.data.data.sn || vipRes.data.data.note || vipRes.data.data.trxid;
+                    await orderRef.update({ adminMessage: `✅ SUKSES API! SN: ${sn}`, status: 'completed' });
+                    // Kirim notif kedua (Laporan Sukses API)
+                    await sendTelegramAlert(`🤖 <b>API SUKSES TERKIRIM!</b>\nSN: <code>${sn}</code>`);
+                } else {
+                    lastError = vipRes.data.message;
+                }
+            } catch (err) {
+                lastError = err.message;
             }
-
-        } catch (err) {
-            // ERROR HANDLER (Tanpa HTML agar tidak ditolak Telegram)
-            console.error("Logic Error:", err);
-            
-            // Fallback terakhir: Kirim notif error sebagai tanda ada order
-            await sendTelegramAlert(
-                `⚠️ ORDER MASUK (LOGIC ERROR)\n` + 
-                `ID: ${order_id}\n` +
-                `Err: ${err.message}\n` +
-                `Uang sudah masuk, tolong cek database/midtrans manual.`, 
-                false // False = Jangan pakai HTML Mode (Plain text)
-            );
         }
+
+        if (!isSuccess) {
+            await orderRef.update({ adminMessage: `❌ GAGAL AUTO: ${lastError}`, status: 'manual_check' });
+            await sendTelegramAlert(`⚠️ <b>API GAGAL!</b> Silakan proses manual.\nErr: ${lastError}`);
+        }
+    } else {
+        // JIKA MANUAL, UPDATE PESAN AGAR USER TIDAK PANIK
+        await orderRef.update({ adminMessage: "📦 Pembayaran diterima. Menunggu admin memproses pesanan..." });
     }
 
     return res.status(200).send('OK');
+
   } catch (e) {
-    console.error("Global Error:", e);
+    console.error("FATAL ERROR:", e);
+    // Jika crash parah, setidaknya coba kirim sinyal
+    await sendTelegramAlert(`🔥 <b>SYSTEM CRASH</b> saat proses order! Cek Vercel Log.`);
     return res.status(500).send('Internal Server Error');
   }
 }
