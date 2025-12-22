@@ -1,26 +1,59 @@
 // File: api/telegram-webhook.js
 import admin from 'firebase-admin';
 
-// Inisialisasi Firebase Admin (Hanya sekali)
-if (!admin.apps.length) {
+// Fungsi Helper untuk membersihkan JSON
+const getServiceAccount = () => {
   try {
-    const serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-    admin.initializeApp({
-      credential: admin.credential.cert(serviceAccount)
-    });
-  } catch (error) {
-    console.error("Firebase Admin Init Error:", error);
+    const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
+    if (!raw) throw new Error("FIREBASE_SERVICE_ACCOUNT kosong di Vercel!");
+    
+    // Jika formatnya sudah object (jarang terjadi di env), kembalikan langsung
+    if (typeof raw === 'object') return raw;
+
+    // Bersihkan string dari potensi masalah formatting
+    return JSON.parse(raw);
+  } catch (e) {
+    console.error("Gagal parsing Service Account:", e.message);
+    return null;
+  }
+};
+
+// Inisialisasi Firebase Admin
+if (!admin.apps.length) {
+  const serviceAccount = getServiceAccount();
+  
+  if (serviceAccount) {
+    try {
+      admin.initializeApp({
+        credential: admin.credential.cert(serviceAccount)
+      });
+      console.log("Firebase Admin Berhasil Init!");
+    } catch (e) {
+      console.error("Firebase Admin Init Error:", e.message);
+    }
   }
 }
-const db = admin.firestore();
+
+// Gunakan try-catch agar tidak crash total jika db belum siap
+let db;
+try {
+  db = admin.firestore();
+} catch (e) {
+  console.error("Firestore belum siap");
+}
 
 export default async function handler(req, res) {
+  // Cek apakah DB siap
+  if (!db) {
+    return res.status(500).json({ error: "Database Connection Failed (Check Logs)" });
+  }
+
   const token = process.env.TELEGRAM_BOT_TOKEN;
   
   // 1. Handle Callback Query (Saat Tombol ACC Ditekan)
   if (req.body.callback_query) {
     const callback = req.body.callback_query;
-    const data = callback.data; // Format: "ACC_TRX-12345"
+    const data = callback.data; 
     const chatId = callback.message.chat.id;
     const messageId = callback.message.message_id;
 
@@ -28,25 +61,26 @@ export default async function handler(req, res) {
       const orderId = data.split('_')[1];
 
       try {
-        // Update Firestore ke 'paid'
+        console.log(`Mencoba ACC Order: ${orderId}`);
         await db.collection('orders').doc(orderId).update({ status: 'paid' });
 
-        // Edit Pesan Telegram biar Admin tau sudah sukses
+        // Edit Pesan Telegram
         await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: chatId,
             message_id: messageId,
-            text: `✅ *SUKSES ACC: ${orderId}*\nStatus Web: PAID\nJangan lupa kirim data jika produk manual!`,
+            text: `✅ *SUKSES ACC: ${orderId}*\nStatus Web: PAID\n\nSilahkan lanjut kirim data (jika ada).`,
             parse_mode: 'Markdown'
           })
         });
       } catch (error) {
-        console.error(error);
+        console.error("Gagal Update Firestore:", error);
       }
     }
-    // Respon agar loading di tombol telegram hilang
+    
+    // Hilangkan loading di tombol
     await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
         method: 'POST', 
         headers: { 'Content-Type': 'application/json' },
@@ -54,48 +88,41 @@ export default async function handler(req, res) {
     });
   }
 
-  // 2. Handle Text Message (Untuk Fitur Isi Konten /isi)
+  // 2. Handle Text Message (/isi)
   else if (req.body.message && req.body.message.text) {
-    const text = req.body.message.text; // Contoh: "/isi TRX-12345678 sn:blabla"
+    const text = req.body.message.text;
     const chatId = req.body.message.chat.id;
 
     if (text.startsWith('/isi')) {
-      // Parsing pesan
       const parts = text.split(' ');
-      const orderId = parts[1]; // TRX-XXXX
-      const content = parts.slice(2).join(' '); // Sisanya adalah konten
+      const orderId = parts[1];
+      const content = parts.slice(2).join(' ');
 
       if (orderId && content) {
         try {
-          // Update Firestore: Masukkan data ke adminMessage atau Items
+          console.log(`Mengisi Konten Order: ${orderId}`);
           await db.collection('orders').doc(orderId).update({
             adminMessage: `DATA PESANAN:\n${content}`,
-            status: 'paid' // Sekalian tandai paid jika belum
+            status: 'paid'
           });
 
-          // Balas Admin
           await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
               chat_id: chatId,
-              text: `✅ *DATA TERKIRIM KE WEB*\nOrder: ${orderId}\nKonten: ${content}`,
+              text: `✅ *DATA TERKIRIM KE WEB*\nOrder: ${orderId}`,
               parse_mode: 'Markdown'
             })
           });
         } catch (error) {
+            console.error("Gagal Isi Konten:", error);
             await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ chat_id: chatId, text: `❌ Gagal Update: ${error.message}` })
+                body: JSON.stringify({ chat_id: chatId, text: `❌ Gagal: ${error.message}` })
             });
         }
-      } else {
-         await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ chat_id: chatId, text: `⚠️ Format Salah.\nGunakan: \`/isi ID_ORDER DATA_KONTEN\``, parse_mode: 'Markdown' })
-        });
       }
     }
   }
