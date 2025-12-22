@@ -1,4 +1,4 @@
-// api/notification.js (V61 - ULTIMATE HYBRID: DATABASE BACKUP NOTIF)
+// api/notification.js (V63 - THE UNSTOPPABLE: DATABASE SOURCE OF TRUTH)
 const midtransClient = require('midtrans-client');
 const axios = require('axios');
 const crypto = require('crypto');
@@ -11,7 +11,10 @@ async function sendTelegramAlert(message) {
     const token = process.env.TELEGRAM_BOT_TOKEN;
     const chatId = process.env.TELEGRAM_CHAT_ID;
     
-    if (!token || !chatId) return; 
+    if (!token || !chatId) {
+        console.error("❌ Telegram Token/ChatID belum disetting di Vercel!");
+        return; 
+    }
 
     try {
         await axios.post(`https://api.telegram.org/bot${token}/sendMessage`, {
@@ -41,7 +44,7 @@ export default async function handler(req, res) {
     const mySignature = crypto.createHash('sha512').update(inputString).digest('hex');
 
     if (signature_key !== mySignature) {
-       await sendTelegramAlert(`🚨 <b>BAHAYA:</b> Percobaan Hack di Order ID: <code>${order_id}</code>`);
+       await sendTelegramAlert(`🚨 <b>BAHAYA:</b> Hack terdeteksi! ID: <code>${order_id}</code>`);
        return res.status(403).json({ message: "Invalid Signature" });
     }
 
@@ -53,42 +56,36 @@ export default async function handler(req, res) {
     const orderRef = db.collection('orders').doc(order_id);
     await orderRef.update({ status: newStatus, last_updated: new Date().toISOString() });
 
-    // 3. LOGIKA NOTIFIKASI & EKSEKUSI (Hanya jika LUNAS / PAID)
+    // 3. LOGIKA EKSEKUSI (Hanya jika LUNAS / PAID)
     if (newStatus === 'paid') {
       try {
-        // --- [V61 FITUR BARU] AMBIL DATA LANGSUNG DARI FIREBASE ---
-        // Ini menjamin kita punya data produk walau custom_field1 kosong
+        // --- STRATEGI BARU V63: AMBIL DATA DARI DATABASE (Anti-Meleset) ---
         const orderSnap = await orderRef.get();
-        if (!orderSnap.exists) throw new Error("Order data not found in DB");
-        const orderData = orderSnap.data();
+        if (!orderSnap.exists) throw new Error("Order tidak ditemukan di Database");
         
-        // Ambil item pertama sebagai referensi info
-        const mainItem = orderData.items && orderData.items.length > 0 ? orderData.items[0] : { name: 'Unknown Item' };
+        const orderData = orderSnap.data();
+        const mainItem = orderData.items && orderData.items.length > 0 ? orderData.items[0] : { name: 'Unknown', processType: 'MANUAL' };
+        
+        // KITA CEK TIPE PRODUK DARI DATABASE, BUKAN DARI MIDTRANS
+        // Jika di DB tertulis 'EXTERNAL_API', maka proses otomatis. Selain itu MANUAL.
+        const isProcessApi = mainItem.processType === 'EXTERNAL_API';
         const userNote = mainItem.note || '-';
-
-        // Cek apakah ada instruksi API di custom_field1
-        let isApiTransaction = false;
-        let apiData = null;
-
-        if (custom_field1) {
-            try {
-                apiData = JSON.parse(custom_field1);
-                if (apiData.is_api && apiData.target_url) {
-                    isApiTransaction = true;
-                }
-            } catch (e) {
-                console.log("Not API Json");
-            }
-        }
 
         // ==========================================
         // JALUR 1: TRANSAKSI API (OTOMATIS)
         // ==========================================
-        if (isApiTransaction) {
+        if (isProcessApi) {
             
+            // Kita butuh data target dari custom_field1 untuk menembak API
+            let apiData = null;
+            try { apiData = JSON.parse(custom_field1); } catch(e) {}
+
+            if (!apiData || !apiData.target_url) {
+                throw new Error("Produk API tapi data target hilang/corrupt!");
+            }
+
             let cleanDataNo = apiData.target_data;
             let cleanZone = '';
-            // Smart Cleaner ID
             if (cleanDataNo.includes('(') || cleanDataNo.includes(' ')) {
                 const parts = cleanDataNo.replace(/[()]/g, ' ').trim().split(/\s+/);
                 if (parts.length >= 2) { cleanDataNo = parts[0]; cleanZone = parts[1]; }
@@ -167,12 +164,11 @@ export default async function handler(req, res) {
 
         } 
         // ==========================================
-        // JALUR 2: TRANSAKSI MANUAL (FALLBACK & NORMAL)
+        // JALUR 2: TRANSAKSI MANUAL (PASTI JALAN)
         // ==========================================
         else {
-            // Ini akan jalan jika:
-            // 1. Produk memang manual
-            // 2. ATAU custom_field1 hilang/error (Backup Plan)
+            // Logika ini PASTI jalan untuk semua produk yang processType != 'EXTERNAL_API'
+            // Tidak peduli custom_field1 ada atau tidak.
             
             await orderRef.update({ adminMessage: "📦 Order Manual Lunas. Menunggu proses admin..." });
 
@@ -191,7 +187,7 @@ export default async function handler(req, res) {
 
       } catch (err) {
         console.error("System Crash:", err);
-        // Notif jika backend crash total pun akan dikirim
+        // Jika script crash, kita tetap dapat notif darurat
         await sendTelegramAlert(`🔥 <b>SYSTEM ERROR</b> di Order: ${order_id}\n${err.message}`);
       }
     }
