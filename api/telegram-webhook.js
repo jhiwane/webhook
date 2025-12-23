@@ -6,7 +6,6 @@ if (!admin.apps.length) {
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
     if (raw) {
       const serviceAccount = JSON.parse(raw);
-      // Fix format key Vercel
       if (serviceAccount.private_key) {
         serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
       }
@@ -29,36 +28,35 @@ export default async function handler(req, res) {
     const messageId = callback.message.message_id;
 
     if (data.startsWith('ACC')) {
-      // Deteksi pemisah data (bisa _ atau |)
       const separator = data.includes('|') ? '|' : '_';
       const parts = data.split(separator);
       const orderId = parts[1];
-      const contactInfo = parts.slice(2).join(separator); // Gabung sisanya jaga-jaga email panjang
+      // Gabungkan sisa parts jika ada pemisah di dalam nama/email
+      const contactInfo = parts.slice(2).join(separator); 
 
       try {
-        // Update Firebase -> Paid
         await db.collection('orders').doc(orderId).update({ status: 'paid' });
 
-        // Edit Pesan Jadi "PROCESSED"
+        // Update Pesan Jadi PROCESSED (Pakai HTML)
         await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: chatId,
             message_id: messageId,
-            text: `✅ *PROSES DATA INPUT*\n🆔 Order: \`${orderId}\`\n👤 Kontak: ${contactInfo}\n\n_Silahkan balas pesan di bawah ini..._ 👇`,
-            parse_mode: 'Markdown'
+            text: `✅ <b>PROSES DATA INPUT</b>\n🆔 Order: <code>${orderId}</code>\n👤 Kontak: <b>${contactInfo}</b>\n\n<i>Silahkan balas pesan di bawah ini...</i> 👇`,
+            parse_mode: 'HTML' // GANTI KE HTML
           })
         });
 
-        // Kirim Prompt Force Reply (Memaksa keyboard muncul)
+        // Kirim Prompt Reply
         await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: chatId,
-            text: `📝 *INPUT DATA PRODUK*\n\nSilahkan balas pesan ini dengan data (Akun/Voucher) untuk:\nOrder ID: #${orderId}\nBuyer: ${contactInfo}`,
-            parse_mode: 'Markdown',
+            text: `📝 <b>INPUT DATA PRODUK</b>\n\nSilahkan balas pesan ini dengan data (Akun/Voucher) untuk:\nOrder ID: #${orderId}\nBuyer: ${contactInfo}`,
+            parse_mode: 'HTML', // GANTI KE HTML
             reply_markup: {
               force_reply: true,
               input_field_placeholder: "Ketik data disini..."
@@ -69,7 +67,7 @@ export default async function handler(req, res) {
       } catch (e) { console.error("Webhook Error:", e); }
     }
     
-    // Hapus loading jam pasir
+    // Hapus loading
     await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ callback_query_id: callback.id }) 
@@ -79,57 +77,57 @@ export default async function handler(req, res) {
   // 2. HANDLE BALASAN ADMIN (REPLY)
   else if (req.body.message && req.body.message.reply_to_message) {
     const msg = req.body.message;
-    const replyText = msg.reply_to_message.text; // Teks bot yg direply
-    const adminContent = msg.text; // Jawaban admin
+    const replyText = msg.reply_to_message.text;
+    const adminContent = msg.text; // Data yang diketik admin
     const chatId = msg.chat.id;
 
-    // Pastikan ini balasan untuk prompt input data
     if (replyText.includes("INPUT DATA PRODUK") && replyText.includes("Order ID: #")) {
         
-        // Ambil ID dan Kontak dari teks pesan bot
         const orderIdMatch = replyText.match(/Order ID: #([^\s]+)/);
-        const buyerMatch = replyText.match(/Buyer: (.*)/); // Ambil sampai akhir baris
+        const buyerMatch = replyText.match(/Buyer: (.*)/);
         
         const orderId = orderIdMatch ? orderIdMatch[1] : null;
         let contactInfo = buyerMatch ? buyerMatch[1].trim() : "";
 
         if (orderId && adminContent) {
             try {
-                // A. UPDATE WEB (FIRESTORE)
+                // A. UPDATE WEB
                 await db.collection('orders').doc(orderId).update({
                     adminMessage: adminContent,
                     status: 'paid'
                 });
 
-                // B. DETEKSI TIPE KONTAK (WA vs EMAIL)
+                // B. DETEKSI KONTAK & BUAT LINK (LOGIKA UTAMA)
                 let linkAction = "";
                 let labelAction = "";
 
+                // Cek apakah Email atau WA
                 if (contactInfo.includes("@")) {
-                    // --- LOGIKA EMAIL ---
-                    const subject = encodeURIComponent(`Pesanan Jisaeshin: ${orderId}`);
-                    const body = encodeURIComponent(`Halo,\n\nBerikut adalah data pesanan Anda (${orderId}):\n\n${adminContent}\n\nTerima kasih!`);
-                    linkAction = `mailto:${contactInfo}?subject=${subject}&body=${body}`;
-                    labelAction = "📧 KIRIM VIA EMAIL";
+                    // --- OPSI 1: EMAIL (Paling Aman pakai HTML) ---
+                    const subject = `Pesanan Jisaeshin: ${orderId}`;
+                    const body = `Halo,\n\nBerikut data pesanan Anda (${orderId}):\n\n${adminContent}\n\nTerima kasih!`;
+                    
+                    // Encode untuk URL tapi jangan double encode simbol aneh
+                    linkAction = `mailto:${contactInfo}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+                    labelAction = "📧 KLIK UNTUK KIRIM EMAIL";
                 } else {
-                    // --- LOGIKA WHATSAPP ---
-                    // Bersihkan nomor (hanya ambil angka)
+                    // --- OPSI 2: WHATSAPP ---
                     let phone = contactInfo.replace(/[^0-9]/g, '');
-                    // Ganti 08 jadi 62
                     if (phone.startsWith("08")) phone = "62" + phone.slice(1);
                     
                     if (phone.length > 5) {
-                        const waText = encodeURIComponent(`Halo, pesanan *${orderId}* sudah selesai!\n\n*DATA PESANAN:*\n${adminContent}\n\nTerima kasih!`);
-                        linkAction = `https://wa.me/${phone}?text=${waText}`;
-                        labelAction = "📱 KIRIM VIA WHATSAPP";
+                        const waText = `Halo, pesanan *${orderId}* sudah selesai!\n\n*DATA PESANAN:*\n${adminContent}\n\nTerima kasih!`;
+                        linkAction = `https://wa.me/${phone}?text=${encodeURIComponent(waText)}`;
+                        labelAction = "📱 KLIK UNTUK KIRIM WA";
                     }
                 }
 
-                // C. LAPORAN SUKSES + LINK
-                let responseText = `✅ *TERKIRIM KE WEB!* 🌐\nData untuk ${orderId} sudah masuk database.`;
+                // C. LAPORAN DENGAN LINK HTML YANG RAPI
+                let responseText = `✅ <b>TERKIRIM KE WEB!</b> 🌐\nData untuk <code>${orderId}</code> sudah masuk database.`;
                 
                 if (linkAction) {
-                    responseText += `\n\n👇 *Klik untuk kirim ke Pelanggan:* \n[${labelAction}](${linkAction})`;
+                    // Syntax HTML Link: <a href="url">Teks</a>
+                    responseText += `\n\n👇 <b>Kirim ke Pelanggan:</b> \n<a href="${linkAction}">${labelAction}</a>`;
                 } else {
                     responseText += `\n\n⚠️ Kontak tidak valid, data hanya disimpan di Web.`;
                 }
@@ -140,12 +138,12 @@ export default async function handler(req, res) {
                     body: JSON.stringify({
                         chat_id: chatId,
                         text: responseText,
-                        parse_mode: 'Markdown',
+                        parse_mode: 'HTML', // PENTING: Mode HTML agar link Email jalan
                         disable_web_page_preview: true
                     })
                 });
 
-            } catch (e) { console.error("DB Update Failed:", e); }
+            } catch (e) { console.error("DB Error:", e); }
         }
     }
   }
