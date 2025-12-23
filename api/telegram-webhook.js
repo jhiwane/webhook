@@ -64,18 +64,23 @@ export default async function handler(req, res) {
       const text = msg.text.trim();
       const chatId = msg.chat.id;
 
-      // --- A. HELP MENU ---
+      // --- A. HELP MENU (SUDAH DIUPDATE) ---
       if (text === '/help' || text === '/start' || text === '/menu') {
           const helpMsg = `🤖 <b>PANEL KONTROL ADMIN</b>\n\n` +
                           `<b>🔎 Tracking & Filter</b>\n` +
-                          `• <code>/trx [ID]</code> : Lacak status pesanan & Kelola\n` +
-                          `• <code>/pending</code> : Lihat orderan yg belum di-ACC\n\n` +
+                          `• <code>/trx [ID]</code> : Lacak & ACC Order\n` +
+                          `• <code>/pending</code> : Cek orderan belum di-ACC\n\n` +
                           `<b>📦 Manajemen Stok</b>\n` +
-                          `• <code>/list</code> : Daftar Kode & Sisa Stok\n` +
-                          `• <code>/cek [KODE]</code> : Lihat isi stok detail\n` +
-                          `• <code>/stok [KODE] [DATA]</code> : Isi stok\n` +
+                          `• <code>/list</code> : Daftar semua stok\n` +
+                          `• <code>/cek [KODE]</code> : Lihat detail item\n` +
+                          `• <code>/stok [KODE] [DATA]</code> : Tambah stok\n` +
                           `• <code>/hapus [KODE] [NO]</code> : Hapus baris stok\n` +
-                          `• <code>/edit [KODE] [NO] [DATA]</code> : Edit baris stok`;
+                          `• <code>/edit [KODE] [NO] [DATA]</code> : Edit isi stok\n\n` +
+                          `<b>🛠️ Edit & Produk Baru (BARU)</b>\n` +
+                          `• <code>/setharga [KODE] [RP]</code> : Ubah harga\n` +
+                          `• <code>/desc [KODE] [TEXT]</code> : Tambah deskripsi\n` +
+                          `• <code>/clone [KODE] [NAMA]</code> : Duplikat produk\n` +
+                          `• <code>/new [KODE] [NAMA] [RP]</code> : Buat produk baru`;
           await replyText(token, chatId, helpMsg);
       }
 
@@ -106,7 +111,6 @@ export default async function handler(req, res) {
                               `📊 <b>Status:</b> ${statusIcon} <b>${o.status.toUpperCase()}</b>\n\n` +
                               `🛒 <b>Items:</b>\n${itemsList}`;
 
-              // Logic Tombol Dinamis
               let keyboard = [];
               if (o.status === 'manual_verification' || o.status === 'manual_pending') {
                   keyboard = [
@@ -130,7 +134,6 @@ export default async function handler(req, res) {
       // --- C. FILTER PENDING (/pending) ---
       else if (text === '/pending') {
           try {
-              // Cari status manual_verification (Menunggu Admin)
               const snapshot = await db.collection('orders')
                   .where('status', 'in', ['manual_verification', 'manual_pending'])
                   .orderBy('date', 'desc')
@@ -153,7 +156,7 @@ export default async function handler(req, res) {
           } catch (e) { await replyText(token, chatId, `Error: ${e.message}`); }
       }
 
-      // --- D. FITUR STOK LAINNYA (/list, /stok, /hapus, /edit) ---
+      // --- D. FITUR MANAJEMEN STOK LAMA (/list, /stok, /cek, /hapus, /edit) ---
       else if (text === '/list') {
           const allProds = await db.collection('products').get();
           let report = "📋 <b>DAFTAR KODE & STOK</b>\n\n";
@@ -276,6 +279,125 @@ export default async function handler(req, res) {
               }
               await replyText(token, chatId, `✏️ <b>DIEDIT:</b>\nLama: <code>${oldItem}</code>\nBaru: <code>${newData}</code>`);
           } catch (e) { await replyText(token, chatId, `Error: ${e.message}`); }
+      }
+
+      // ==========================================================
+      // --- E. FITUR BARU (HARGA, DESKRIPSI, CLONE, NEW) ---
+      // ==========================================================
+
+      // 1. UPDATE HARGA (/setharga KODE HARGA_BARU)
+      else if (text.startsWith('/setharga')) {
+          const args = text.replace('/setharga', '').trim().split(' ');
+          if (args.length < 2) return await replyText(token, chatId, "⚠️ Format: <code>/setharga [KODE] [HARGA]</code>");
+          
+          const code = args[0];
+          const priceRaw = args[1];
+          const newPrice = parseInt(priceRaw.replace(/[^0-9]/g, '')); 
+          
+          if (isNaN(newPrice)) return await replyText(token, chatId, "❌ Harga harus angka.");
+
+          const target = await findProductByCode(code);
+          if (!target) return await replyText(token, chatId, "❌ Kode produk tidak ditemukan.");
+
+          try {
+              const docRef = db.collection('products').doc(target.doc.id);
+              const pData = target.doc.data();
+              let prodName = pData.name;
+
+              if (target.type === 'variant') {
+                  const vars = [...pData.variations];
+                  vars[target.index].price = newPrice;
+                  prodName += ` (${vars[target.index].name})`;
+                  await docRef.update({ variations: vars });
+              } else {
+                  await docRef.update({ price: newPrice });
+              }
+
+              await replyText(token, chatId, `💰 <b>HARGA UPDATE!</b>\nProduk: ${prodName}\nBaru: ${fmtRp(newPrice)}`);
+          } catch (e) { await replyText(token, chatId, `Error: ${e.message}`); }
+      }
+
+      // 2. TAMBAH DESKRIPSI (/desc KODE TEXT)
+      else if (text.startsWith('/desc')) {
+          const parts = text.replace('/desc', '').trim().split(' ');
+          if (parts.length < 2) return await replyText(token, chatId, "⚠️ Format: <code>/desc [KODE] [TEXT_TAMBAHAN]</code>");
+          
+          const code = parts[0];
+          const addText = parts.slice(1).join(' ');
+
+          const target = await findProductByCode(code);
+          if (!target) return await replyText(token, chatId, "❌ Kode tidak ditemukan.");
+          
+          try {
+              const docRef = db.collection('products').doc(target.doc.id);
+              const currentDesc = target.doc.data().description || "";
+              
+              const newDesc = currentDesc + "\n• " + addText;
+
+              await docRef.update({ description: newDesc });
+              await replyText(token, chatId, `📝 <b>DESKRIPSI DITAMBAH!</b>\nProduk: ${target.doc.data().name}\n\nIsi: ...\n• ${addText}`);
+          } catch (e) { await replyText(token, chatId, `Error: ${e.message}`); }
+      }
+
+      // 3. CLONE PRODUK (/clone KODE NAMA_BARU)
+      else if (text.startsWith('/clone')) {
+          const parts = text.replace('/clone', '').trim().split(' ');
+          if (parts.length < 2) return await replyText(token, chatId, "⚠️ Format: <code>/clone [KODE_SUMBER] [NAMA_BARU]</code>");
+
+          const srcCode = parts[0];
+          const newName = parts.slice(1).join(' ');
+
+          const target = await findProductByCode(srcCode);
+          if (!target) return await replyText(token, chatId, "❌ Produk sumber tidak ditemukan.");
+
+          try {
+              const srcData = target.doc.data();
+              
+              delete srcData.id; 
+              srcData.name = newName;
+              srcData.createdAt = new Date().toISOString();
+              
+              const rand = Math.floor(100 + Math.random() * 900); 
+              srcData.serviceCode = srcCode + "-COPY-" + rand;
+
+              if (srcData.items) srcData.realSold = 0;
+              if (srcData.variations) {
+                  srcData.variations = srcData.variations.map(v => ({
+                      ...v, 
+                      serviceCode: v.serviceCode ? v.serviceCode + "-" + rand : null,
+                      realSold: 0
+                  }));
+              }
+
+              const newRef = await db.collection('products').add(srcData);
+              
+              await replyText(token, chatId, `🚀 <b>PRODUK DI-CLONE!</b>\n\nNama: ${newName}\nKode Baru: <code>${srcData.serviceCode}</code>\nID Doc: <code>${newRef.id}</code>\n\n<i>Silakan edit harga/kode jika diperlukan.</i>`);
+          } catch (e) { await replyText(token, chatId, `Error: ${e.message}`); }
+      }
+
+      // 4. BUAT PRODUK BARU SIMPEL (/new KODE NAMA HARGA)
+      else if (text.startsWith('/new')) {
+           const parts = text.replace('/new', '').trim().split(' ');
+           if (parts.length < 3) return await replyText(token, chatId, "⚠️ Format: <code>/new [KODE] [NAMA] [HARGA]</code>");
+           
+           const code = parts[0];
+           const price = parseInt(parts[parts.length-1].replace(/[^0-9]/g, ''));
+           const name = parts.slice(1, parts.length-1).join(' ');
+
+           if (isNaN(price)) return await replyText(token, chatId, "❌ Harga error.");
+
+           try {
+               await db.collection('products').add({
+                   serviceCode: code,
+                   name: name,
+                   price: price,
+                   description: "Deskripsi belum diisi.",
+                   items: [],
+                   category: "General",
+                   createdAt: new Date().toISOString()
+               });
+               await replyText(token, chatId, `✨ <b>PRODUK BARU DIBUAT!</b>\n\nNama: ${name}\nKode: <code>${code}</code>\nHarga: ${fmtRp(price)}\n\n<i>Gunakan /stok ${code} ... untuk isi stok.</i>`);
+           } catch (e) { await replyText(token, chatId, `Error: ${e.message}`); }
       }
   }
 
