@@ -1,5 +1,5 @@
 export default async function handler(req, res) {
-  // --- SETTING CORS ---
+  // --- 1. SETTING CORS ---
   res.setHeader('Access-Control-Allow-Credentials', true);
   res.setHeader('Access-Control-Allow-Origin', '*'); 
   res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
@@ -8,58 +8,48 @@ export default async function handler(req, res) {
   if (req.method === 'OPTIONS') { res.status(200).end(); return; }
   if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
 
-  // --- SETTING TOKEN ---
+  // --- 2. AMBIL TOKEN DARI ENV VERCEL (AMAN) ---
   const token = process.env.TELEGRAM_BOT_TOKEN;
   const chatId = process.env.TELEGRAM_ADMIN_ID;
 
-  if (!token || !chatId) return res.status(500).json({ error: 'Env Var Missing' });
+  if (!token || !chatId) {
+    return res.status(500).json({ error: 'Environment Variables belum disetting di Vercel!' });
+  }
 
-  // --- AMBIL DATA ---
-  // Kita tambah parameter 'type' untuk membedakan Manual vs Auto
+  // --- 3. PROSES DATA ---
   const { orderId, total, items, buyerContact, type = 'manual' } = req.body;
 
-  // Cari Nomor HP
-  let buyerPhone = "0";
+  // Logika Cerdas Mencari Kontak (WA atau Email)
+  let contactInfo = "-";
   if (buyerContact) {
-      buyerPhone = buyerContact; 
+      contactInfo = buyerContact; 
   } else if (items && items.length > 0 && items[0].data && items[0].data.length > 0) {
-      buyerPhone = items[0].data[0]; 
+      contactInfo = items[0].data[0]; 
   }
 
+  // Format list item
   const itemList = items ? items.map(i => `- ${i.name} (x${i.qty})`).join('\n') : '- Item tidak terdeteksi';
 
-  // --- LOGIKA PESAN BEDA TIPE ---
-  let title = "";
-  let actionText = "";
-  let buttonText = "";
-
-  if (type === 'auto') {
-      // Skenario Midtrans
-      title = "💰 *PEMBAYARAN LUNAS (MIDTRANS)*";
-      actionText = "✅ Uang sudah masuk otomatis.\n👇 Klik tombol di bawah untuk input data produk.";
-      buttonText = "🚀 ISI DATA PRODUK";
-  } else {
-      // Skenario Manual
-      title = "🔔 *KONFIRMASI PEMBAYARAN MANUAL*";
-      actionText = "1. Cek Mutasi Bank/E-Wallet.\n2. Jika masuk, klik ACC di bawah.";
-      buttonText = "✅ ACC PAID & ISI DATA";
-  }
+  // Logika Judul Pesan
+  let title = type === 'auto' ? "💰 *LUNAS (MIDTRANS)*" : "🔔 *CEK MUTASI (MANUAL)*";
+  let buttonText = type === 'auto' ? "🚀 ISI DATA" : "✅ ACC & ISI DATA";
 
   const text = `
 ${title}
 --------------------------------
-🆔 *${orderId}*
+🆔 \`${orderId}\`
 💰 *Rp ${parseInt(total).toLocaleString()}*
-📞 *Kontak:* \`${buyerPhone}\`
+👤 *Kontak:* \`${contactInfo}\`
 
 📦 *Item:*
 ${itemList}
 
 👇 *AKSI ADMIN:*
-${actionText}
+${type === 'auto' ? 'Data belum dikirim. Klik tombol di bawah.' : 'Cek uang masuk, lalu klik tombol di bawah.'}
   `.trim();
 
   try {
+    // Kirim ke Telegram
     const response = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -70,8 +60,8 @@ ${actionText}
         reply_markup: {
           inline_keyboard: [
             [
-              // Tombol ini akan memicu "Force Reply" di Webhook yang sudah kita buat sebelumnya
-              { text: buttonText, callback_data: `ACC_${orderId}_${buyerPhone}` }
+              // Tombol membawa ID dan Kontak untuk diproses Webhook
+              { text: buttonText, callback_data: `ACC|${orderId}|${contactInfo}` }
             ]
           ]
         }
