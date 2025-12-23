@@ -17,134 +17,112 @@ export default async function handler(req, res) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
   if (!db) return res.status(500).json({ error: "DB Error" });
 
-  // --- 1. HANDLE TOMBOL (CALLBACK QUERY) ---
+  // --- 1. HANDLE TOMBOL (ACC / COMPLAIN / REVISI) ---
   if (req.body.callback_query) {
     const callback = req.body.callback_query;
     const data = callback.data; 
     const chatId = callback.message.chat.id;
-    const messageId = callback.message.message_id;
 
-    // Deteksi Pemisah Data
     const separator = data.includes('|') ? '|' : '_';
     const parts = data.split(separator);
     const action = parts[0]; 
     const orderId = parts[1];
     const contactInfo = parts.slice(2).join(separator);
 
-    // --- LOGIKA UTAMA ---
+    let replyText = "";
+    let placeholder = "";
+
+    // JIKA ADMIN MAU ISI DATA / REVISI DATA UTAMA
     if (action === 'ACC' || action === 'REVISI') {
-        // 1. Update Status ke PAID (Aman diulang-ulang)
         await db.collection('orders').doc(orderId).update({ status: 'paid' });
-
-        // 2. Ambil Data Order untuk Contekan Item (Solusi Poin 3)
-        let itemListText = "Detail Item tidak terbaca.";
+        
+        // Pancingan Text Harus Unik
+        replyText = `📝 <b>MODE INPUT DATA UTAMA</b>\n\nSilahkan ketik data untuk Order: #${orderId}\nBuyer: ${contactInfo}`;
+        placeholder = "Paste data akun disini...";
+        
         try {
-            const orderDoc = await db.collection('orders').doc(orderId).get();
-            if (orderDoc.exists) {
-                const items = orderDoc.data().items || [];
-                // Buat daftar item untuk admin
-                itemListText = items.map((i, idx) => `${idx+1}. ${i.name} (x${i.qty})`).join('\n');
-            }
-        } catch (e) { console.error("Gagal ambil detail item"); }
-
-        // 3. EDIT PESAN ASLI (TAPI TETAPKAN TOMBOL REVISI DISANA!)
-        // Ini Solusi Poin 2: Tombol tidak akan hilang selamanya.
-        await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: chatId,
-                message_id: messageId,
-                // Tampilkan daftar item biar admin gak lupa
-                text: `✅ <b>STATUS: PAID / LUNAS</b>\n🆔 Order: <code>${orderId}</code>\n👤 Buyer: ${contactInfo}\n\n📦 <b>DAFTAR BARANG:</b>\n<pre>${itemListText}</pre>\n\n👇 <i>Klik tombol di bawah untuk isi/edit data:</i>`,
-                parse_mode: 'HTML',
-                reply_markup: {
-                    inline_keyboard: [[
-                        // TOMBOL INI ADALAH PENYELAMAT JIKA KEYBOARD KE-CLOSE
-                        { text: "📝 ISI / EDIT KONTEN", callback_data: `REVISI|${orderId}|${contactInfo}` }
-                    ]]
-                }
-            })
-        });
-
-        // 4. MUNCULKAN KEYBOARD INPUT (FORCE REPLY)
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: chatId,
-                text: `⌨️ <b>MODE INPUT DATA</b>\n\nSilahkan ketik data untuk Order #${orderId}.\n\n<b>Tips Multi-Item:</b>\nGunakan Enter untuk pemisah.\nContoh:\n<i>ML: 12345\nFF: 67890</i>`,
-                parse_mode: 'HTML',
-                reply_markup: { 
-                    force_reply: true, 
-                    input_field_placeholder: "Ketik data disini..." 
-                }
-            })
-        });
+          await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
+              method: 'POST', headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({
+                  chat_id: chatId, message_id: callback.message.message_id,
+                  text: `✅ <b>DIPROSES</b> (Order: ${orderId})`, parse_mode: 'HTML'
+              })
+          });
+        } catch(e) {}
     } 
-    
-    // Logika Komplain (Sama seperti sebelumnya)
+    // JIKA ADMIN MAU BALAS KOMPLAIN (HANYA ITEM EROR)
     else if (action === 'COMPLAIN') {
-         await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-            method: 'POST', headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                chat_id: chatId,
-                text: `🛡️ <b>BALAS KOMPLAIN #${orderId}</b>\nSilahkan ketik solusinya:`,
-                parse_mode: 'HTML',
-                reply_markup: { force_reply: true }
-            })
-        });
+        // Pancingan Text Harus Unik
+        replyText = `🛠️ <b>MODE BALAS KOMPLAIN</b>\n\nKetik solusi/pengganti untuk Order: #${orderId}\nBuyer: ${contactInfo}\n\n<i>Tips: Cukup ketik item yang eror saja.</i>`;
+        placeholder = "Contoh: Capcut: email|pass baru";
     }
 
-    // Hapus loading
+    // KIRIM FORM INPUT (FORCE REPLY)
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: replyText,
+        parse_mode: 'HTML',
+        reply_markup: { force_reply: true, input_field_placeholder: placeholder }
+      })
+    });
+    
     await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ callback_query_id: callback.id }) 
     });
   }
 
-  // --- 2. HANDLE BALASAN ADMIN (REPLY) ---
+  // --- 2. HANDLE JAWABAN ADMIN (REPLY) ---
   else if (req.body.message && req.body.message.reply_to_message) {
     const msg = req.body.message;
-    const replyOrigin = msg.reply_to_message.text;
-    const adminContent = msg.text;
+    const replyOrigin = msg.reply_to_message.text; // Teks Pancingan
+    const adminContent = msg.text; // Jawaban Admin
     const chatId = msg.chat.id;
 
-    // Deteksi apakah ini balasan input data
-    if (replyOrigin.includes("MODE INPUT DATA") || replyOrigin.includes("BALAS KOMPLAIN")) {
-        
-        // Kita ambil ID dari Pesan Asli yang di-Reply (Bot harus kirim ID di pesan replynya)
-        // Agar lebih aman, kita ambil ID dari text "Order #..." di prompt
-        const orderIdMatch = replyOrigin.match(/Order #([^\s\.]+)/);
-        const orderId = orderIdMatch ? orderIdMatch[1] : null;
+    // KITA CARI ID ORDER DARI TEKS PANCINGAN
+    const orderIdMatch = replyOrigin.match(/Order: #([^\s]+)/);
+    const orderId = orderIdMatch ? orderIdMatch[1] : null;
 
-        if (orderId && adminContent) {
-            try {
-                // Cek apakah ini komplain atau input biasa
-                const isComplain = replyOrigin.includes("BALAS KOMPLAIN");
-                
-                // Update DB
-                const updateData = isComplain 
-                    ? { complaintReply: adminContent, hasComplaint: false }
-                    : { adminMessage: adminContent, status: 'paid' };
-                
-                await db.collection('orders').doc(orderId).update(updateData);
+    if (orderId && adminContent) {
+        try {
+            // DETEKSI: INI REVISI UTAMA ATAU BALAS KOMPLAIN?
+            const isComplainReply = replyOrigin.includes("MODE BALAS KOMPLAIN");
 
-                // Kirim Konfirmasi Sukses ke Admin
-                // TAPI JANGAN LUPA SERTAKAN TOMBOL REVISI LAGI (JAGA-JAGA TYPO)
-                
-                // Ambil data buyer phone lagi dari DB biar akurat (opsional, atau ambil dari logic sebelumnya klo disimpan)
-                // Disini kita sederhanakan response suksesnya
-                await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-                    method: 'POST', headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        chat_id: chatId,
-                        text: `✅ <b>DATA TERSIMPAN!</b>\nOrder: <code>${orderId}</code>\n\nIsi: <pre>${adminContent}</pre>`,
-                        parse_mode: 'HTML'
-                    })
-                });
+            // A. UPDATE DATABASE
+            let updateData = {};
+            if (isComplainReply) {
+                // Jika balasan komplain, Update field KHUSUS 'complaintReply'
+                updateData = { complaintReply: adminContent, hasComplaint: false };
+            } else {
+                // Jika input data utama, Update 'adminMessage' dan 'status'
+                updateData = { adminMessage: adminContent, status: 'paid', complaintReply: admin.firestore.FieldValue.delete() }; 
+                // Note: complaintReply dihapus biar bersih kalau admin revisi ulang semua
+            }
+            
+            await db.collection('orders').doc(orderId).update(updateData);
 
-            } catch (e) { console.error(e); }
-        }
+            // B. KIRIM KONFIRMASI KE TELEGRAM
+            let messageResult = `✅ <b>${isComplainReply ? 'SOLUSI TERKIRIM' : 'DATA TERSIMPAN'}!</b>\nID: <code>${orderId}</code>\n\n`;
+            messageResult += `Isi: <pre>${adminContent}</pre>`;
+
+            // Tombol Revisi Selalu Ada
+            await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    chat_id: chatId,
+                    text: messageResult,
+                    parse_mode: 'HTML',
+                    reply_markup: {
+                        inline_keyboard: [[
+                            { text: "✏️ REVISI DATA UTAMA", callback_data: `REVISI|${orderId}|-` }
+                        ]]
+                    }
+                })
+            });
+
+        } catch (e) { console.error(e); }
     }
   }
   return res.status(200).send('OK');
