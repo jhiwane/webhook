@@ -15,7 +15,7 @@ const db = admin.apps.length ? admin.firestore() : null;
 
 export default async function handler(req, res) {
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  const baseUrl = "https://" + req.headers.host; // Mendapatkan URL website otomatis
+  const baseUrl = "https://" + req.headers.host; 
 
   if (!db) return res.status(500).send("DB Error");
 
@@ -28,25 +28,24 @@ export default async function handler(req, res) {
     const chatId = callback.message.chat.id;
     const messageId = callback.message.message_id;
 
+    // Format Data: ACTION|ORDER_ID|EXTRA|INDEX
     const parts = data.split('|');
     const action = parts[0];
     const orderId = parts[1];
-    // Variabel extra (bisa index item atau kontak buyer)
-    const extra = parts[2]; 
+    const extra = parts[2]; // Bisa Kontak atau Index
+    const indexParam = parts[3]; // Opsional (Index Item)
 
     // --- SKENARIO 1: ADMIN KLIK "ACC" (MANUAL) ---
     if (action === 'ACC') {
-        const buyerContact = extra; // Diambil dari tombol ACC|ID|KONTAK
-
-        // 1. Update DB jadi PAID
+        const buyerContact = extra; 
         const orderRef = db.collection('orders').doc(orderId);
         const docSnap = await orderRef.get();
+        
         if(docSnap.exists) {
             await orderRef.update({ status: 'paid' });
             const items = docSnap.data().items;
 
-            // 2. Panggil API Notify lagi untuk memunculkan Tombol Input Item
-            // Kita "pura-pura" jadi sistem auto payment yang memanggil notifikasi
+            // Trigger Notify lagi untuk memunculkan tombol Input
             await fetch(`${baseUrl}/api/telegram-notify`, {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
@@ -55,39 +54,29 @@ export default async function handler(req, res) {
                     total: docSnap.data().total,
                     items: items,
                     buyerContact: buyerContact,
-                    type: 'auto' // Trik: Set ke auto agar muncul tombol input
+                    type: 'paid_trigger' 
                 })
             });
 
-            // 3. Hapus/Edit pesan "Cek Mutasi" biar tidak menuhin chat
             await fetch(`https://api.telegram.org/bot${token}/deleteMessage`, {
                 method: 'POST', headers: {'Content-Type': 'application/json'},
                 body: JSON.stringify({ chat_id: chatId, message_id: messageId })
             });
-            
-            // Atau cukup kirim notif kecil
-            await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
-                method: 'POST', headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({ callback_query_id: callback.id, text: "✅ Pesanan di-ACC. Menu Input muncul..." })
-            });
         }
     }
 
-    // --- SKENARIO 2: ADMIN KLIK "ISI ITEM #X" ---
+    // --- SKENARIO 2: ADMIN KLIK "ISI ITEM" (NORMAL) ---
     else if (action === 'INPUT') {
-        const itemIndex = parseInt(extra);
-        
-        // Ambil nama item dari DB untuk label
+        const itemIndex = parseInt(extra); // Di tombol INPUT, parameter ke-3 adalah Index
         const docSnap = await db.collection('orders').doc(orderId).get();
         const itemName = docSnap.exists ? docSnap.data().items[itemIndex].name : "Item";
 
-        // Kirim Force Reply (Agar admin bisa ngetik)
-        // Kita selipkan ID dan Index di teks agar bisa diparsing nanti
         await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
             body: JSON.stringify({
                 chat_id: chatId,
+                // PENTING: Teks pancingan mengandung kata "INPUT DATA"
                 text: `✍️ <b>INPUT DATA KONTEN</b>\n\nProduk: <b>${itemName}</b>\nOrder: <code>${orderId}</code>\nIndex: ${itemIndex}\n\n<i>Silahkan Reply/Paste data (Email/Pass/Kode) untuk item ini:</i>`,
                 parse_mode: 'HTML',
                 reply_markup: {
@@ -96,78 +85,102 @@ export default async function handler(req, res) {
                 }
             })
         });
+    }
 
-        // Tutup loading jam pasir
-        await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
-            method: 'POST', headers: {'Content-Type': 'application/json'},
-            body: JSON.stringify({ callback_query_id: callback.id })
+    // --- SKENARIO 3: ADMIN KLIK "BALAS KOMPLAIN" (BARU) ---
+    else if (action === 'COMPLAIN') {
+        // Cek apakah komplain ini spesifik item (ada index) atau global
+        const itemIdx = indexParam ? parseInt(indexParam) : null;
+        const label = itemIdx !== null ? `ITEM #${itemIdx+1}` : "UMUM";
+
+        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                chat_id: chatId,
+                // PENTING: Teks pancingan mengandung kata "BALAS KOMPLAIN"
+                text: `🛡️ <b>BALAS KOMPLAIN (${label})</b>\n\nOrder: <code>${orderId}</code>\nIndex: ${itemIdx !== null ? itemIdx : '-'}\n\n<i>Silahkan ketik solusi atau pesan balasan untuk pembeli:</i>`,
+                parse_mode: 'HTML',
+                reply_markup: {
+                    force_reply: true,
+                    input_field_placeholder: `Solusi komplain...`
+                }
+            })
         });
     }
+
+    // Tutup loading jam pasir
+    await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({ callback_query_id: callback.id })
+    });
   }
 
   // ============================================================
-  // 2. HANDLE BALASAN ADMIN (TEXT REPLY) - SINKRONISASI WEB
+  // 2. HANDLE BALASAN ADMIN (TEXT REPLY)
   // ============================================================
   else if (req.body.message && req.body.message.reply_to_message) {
     const msg = req.body.message;
-    const replyOrigin = msg.reply_to_message.text;
+    const replyOrigin = msg.reply_to_message.text; // Teks Pancingan Bot
     const adminContent = msg.text;
     const chatId = msg.chat.id;
 
-    // Parsing ID dan Index dari teks pancingan bot
+    // Parsing ID dan Index
     const orderIdMatch = replyOrigin.match(/Order: ([^\s\n]+)/);
-    const indexMatch = replyOrigin.match(/Index: (\d+)/);
+    const indexMatch = replyOrigin.match(/Index: (\d+|-)/);
 
     const orderId = orderIdMatch ? orderIdMatch[1] : null;
-    const itemIndex = indexMatch ? parseInt(indexMatch[1]) : null;
+    let itemIndex = (indexMatch && indexMatch[1] !== '-') ? parseInt(indexMatch[1]) : null;
 
-    if (orderId && itemIndex !== null && adminContent) {
+    if (orderId && adminContent) {
         try {
             const orderRef = db.collection('orders').doc(orderId);
             const doc = await orderRef.get();
             if (!doc.exists) throw new Error("Order tidak ditemukan");
 
-            let items = doc.data().items;
-            const buyerContact = items[0]?.note || "Pembeli"; // Ambil kontak dari note item pertama
+            let items = doc.data().items || [];
+            let updateData = {};
+            let replyTitle = "";
 
-            // --- INI KUNCI SINKRONISASINYA ---
-            // 1. Masukkan data admin ke array item
-            items[itemIndex].data = [adminContent]; 
-            
-            // 2. Ubah status Manual jadi FALSE
-            // Ini yang membuat Web User berubah dari "Menunggu" jadi "Data Muncul"
-            items[itemIndex].isManual = false; 
-            items[itemIndex].note = "✅ Data Terkirim";
+            // --- CEK TIPE BALASAN: APAKAH INI KOMPLAIN ATAU INPUT DATA? ---
+            const isComplaintReply = replyOrigin.includes("BALAS KOMPLAIN");
 
-            // 3. Simpan ke DB
-            await orderRef.update({ items: items, status: 'paid' });
+            if (isComplaintReply) {
+                // >>> LOGIKA BALAS KOMPLAIN <<<
+                replyTitle = "SOLUSI KOMPLAIN";
+                
+                // Jika komplain spesifik item (Index ada), simpan di Note item tersebut
+                if (itemIndex !== null && items[itemIndex]) {
+                    const oldNote = items[itemIndex].note || "";
+                    items[itemIndex].note = `[ADMIN]: ${adminContent} | ${oldNote}`;
+                    updateData = { items: items };
+                } else {
+                    // Jika komplain umum (Index '-'), simpan di field complaintReply global
+                    updateData = { complaintReply: adminContent };
+                }
 
-            // 4. Siapkan Link Kirim ke User (WA & Email)
-            let sendLinks = "";
-            let cleanPhone = buyerContact.replace(/[^0-9]/g, '');
-            if(cleanPhone.startsWith('08')) cleanPhone = '62' + cleanPhone.slice(1);
-            
-            // Link WA
-            if(cleanPhone.length > 6) {
-                const waMsg = `Halo, pesanan *${items[itemIndex].name}* (ID: ${orderId}) sudah diproses:\n\n${adminContent}\n\nTerima kasih!`;
-                sendLinks += `📱 <a href="https://wa.me/${cleanPhone}?text=${encodeURIComponent(waMsg)}">Kirim ke WhatsApp</a>\n`;
+            } else {
+                // >>> LOGIKA INPUT DATA NORMAL (INPUT KONTEN) <<<
+                replyTitle = "DATA TERSIMPAN";
+                if (itemIndex !== null && items[itemIndex]) {
+                    items[itemIndex].data = [adminContent];
+                    items[itemIndex].isManual = false; // Matikan status manual agar muncul di web
+                    items[itemIndex].note = "✅ Data Terkirim";
+                    updateData = { items: items, status: 'paid' };
+                }
             }
-            // Link Email (Jika terdeteksi email)
-            if(buyerContact.includes('@')) {
-                const mailSub = `Pesanan Selesai: ${items[itemIndex].name}`;
-                const mailBody = `Halo,\n\nBerikut data pesanan Anda:\n\n${adminContent}\n\nTerima kasih.`;
-                sendLinks += `📧 <a href="mailto:${buyerContact}?subject=${encodeURIComponent(mailSub)}&body=${encodeURIComponent(mailBody)}">Kirim Email</a>`;
-            }
 
-            // 5. Beri Konfirmasi ke Admin & Link Forward
+            // EKSEKUSI UPDATE KE FIREBASE
+            await orderRef.update(updateData);
+
+            // KONFIRMASI KE ADMIN
             await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     chat_id: chatId,
-                    text: `✅ <b>DATA TERSIMPAN KE WEB!</b>\nItem: ${items[itemIndex].name}\n\nForward ke Pembeli:\n${sendLinks || "<i>(Tidak ada kontak valid terdeteksi)</i>"}`,
-                    parse_mode: 'HTML',
-                    disable_web_page_preview: true
+                    text: `✅ <b>${replyTitle} BERHASIL!</b>\nOrder: ${orderId}\n\nPesan: "${adminContent}"\n\n<i>Sudah muncul di web pembeli.</i>`,
+                    parse_mode: 'HTML'
                 })
             });
 
