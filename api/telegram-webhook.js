@@ -1,6 +1,6 @@
 import admin from 'firebase-admin';
 
-// --- INIT FIREBASE ---
+// --- 1. INIT FIREBASE (Auto-Fix Key Vercel) ---
 if (!admin.apps.length) {
   try {
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -11,7 +11,7 @@ if (!admin.apps.length) {
       }
       admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
     }
-  } catch (e) { console.error("Init Error:", e.message); }
+  } catch (e) { console.error("Firebase Error:", e.message); }
 }
 const db = admin.apps.length ? admin.firestore() : null;
 
@@ -20,7 +20,7 @@ export default async function handler(req, res) {
   
   if (!db) return res.status(500).json({ error: "Database Error" });
 
-  // 1. HANDLE TOMBOL (CALLBACK QUERY)
+  // --- 2. HANDLE TOMBOL ACC (CALLBACK QUERY) ---
   if (req.body.callback_query) {
     const callback = req.body.callback_query;
     const data = callback.data; 
@@ -31,40 +31,39 @@ export default async function handler(req, res) {
       const separator = data.includes('|') ? '|' : '_';
       const parts = data.split(separator);
       const orderId = parts[1];
-      // Gabungkan sisa parts jika ada pemisah di dalam nama/email
       const contactInfo = parts.slice(2).join(separator); 
 
       try {
         await db.collection('orders').doc(orderId).update({ status: 'paid' });
 
-        // Update Pesan Jadi PROCESSED (Pakai HTML)
+        // Update Pesan Lama
         await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: chatId,
             message_id: messageId,
-            text: `✅ <b>PROSES DATA INPUT</b>\n🆔 Order: <code>${orderId}</code>\n👤 Kontak: <b>${contactInfo}</b>\n\n<i>Silahkan balas pesan di bawah ini...</i> 👇`,
-            parse_mode: 'HTML' // GANTI KE HTML
+            text: `✅ <b>PEMBAYARAN DITERIMA</b>\n🆔 Order: <code>${orderId}</code>\n👤 Kontak: <b>${contactInfo}</b>\n\n<i>Silahkan balas pesan di bawah ini untuk isi data...</i> 👇`,
+            parse_mode: 'HTML'
           })
         });
 
-        // Kirim Prompt Reply
+        // Kirim Pesan Force Reply
         await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             chat_id: chatId,
             text: `📝 <b>INPUT DATA PRODUK</b>\n\nSilahkan balas pesan ini dengan data (Akun/Voucher) untuk:\nOrder ID: #${orderId}\nBuyer: ${contactInfo}`,
-            parse_mode: 'HTML', // GANTI KE HTML
+            parse_mode: 'HTML',
             reply_markup: {
               force_reply: true,
-              input_field_placeholder: "Ketik data disini..."
+              input_field_placeholder: "Paste data akun disini..."
             }
           })
         });
 
-      } catch (e) { console.error("Webhook Error:", e); }
+      } catch (e) { console.error("Webhook ACC Error:", e); }
     }
     
     // Hapus loading
@@ -74,11 +73,11 @@ export default async function handler(req, res) {
     });
   }
 
-  // 2. HANDLE BALASAN ADMIN (REPLY)
+  // --- 3. HANDLE BALASAN ADMIN (LOGIKA LINK POWERFULL) ---
   else if (req.body.message && req.body.message.reply_to_message) {
     const msg = req.body.message;
     const replyText = msg.reply_to_message.text;
-    const adminContent = msg.text; // Data yang diketik admin
+    const adminContent = msg.text; 
     const chatId = msg.chat.id;
 
     if (replyText.includes("INPUT DATA PRODUK") && replyText.includes("Order ID: #")) {
@@ -91,59 +90,62 @@ export default async function handler(req, res) {
 
         if (orderId && adminContent) {
             try {
-                // A. UPDATE WEB
+                // A. Update Database
                 await db.collection('orders').doc(orderId).update({
                     adminMessage: adminContent,
                     status: 'paid'
                 });
 
-                // B. DETEKSI KONTAK & BUAT LINK (LOGIKA UTAMA)
-                let linkAction = "";
-                let labelAction = "";
-
-                // Cek apakah Email atau WA
+                // B. GENERATE LINK (HTML STRICT MODE)
+                let messageResult = `✅ <b>DATA TERKIRIM KE WEB!</b> 🌐\nData untuk <code>${orderId}</code> sudah masuk database.`;
+                
+                // Cek Tipe Kontak
                 if (contactInfo.includes("@")) {
-                    // --- OPSI 1: EMAIL (Paling Aman pakai HTML) ---
+                    // --- MODE EMAIL ---
                     const subject = `Pesanan Jisaeshin: ${orderId}`;
-                    const body = `Halo,\n\nBerikut data pesanan Anda (${orderId}):\n\n${adminContent}\n\nTerima kasih!`;
+                    // Tips: Email butuh \r\n untuk baris baru
+                    const body = `Halo,\n\nBerikut data pesanan Anda (${orderId}):\n\n${adminContent}\n\nTerima kasih!`.replace(/\n/g, "\r\n");
                     
-                    // Encode untuk URL tapi jangan double encode simbol aneh
-                    linkAction = `mailto:${contactInfo}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-                    labelAction = "📧 KLIK UNTUK KIRIM EMAIL";
+                    // RAKIT LINK MAILTO DENGAN BENAR
+                    const mailtoUrl = `mailto:${contactInfo}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+                    
+                    // Masukkan ke Tag HTML
+                    messageResult += `\n\n📧 <b>Kirim ke Email Pelanggan:</b>\n<a href="${mailtoUrl}">👉 KLIK DISINI UNTUK BUKA GMAIL</a>`;
+                    messageResult += `\n\n<i>(Jika link tidak bisa diklik, copy email ini: <code>${contactInfo}</code>)</i>`;
+
                 } else {
-                    // --- OPSI 2: WHATSAPP ---
+                    // --- MODE WHATSAPP ---
                     let phone = contactInfo.replace(/[^0-9]/g, '');
                     if (phone.startsWith("08")) phone = "62" + phone.slice(1);
                     
                     if (phone.length > 5) {
                         const waText = `Halo, pesanan *${orderId}* sudah selesai!\n\n*DATA PESANAN:*\n${adminContent}\n\nTerima kasih!`;
-                        linkAction = `https://wa.me/${phone}?text=${encodeURIComponent(waText)}`;
-                        labelAction = "📱 KLIK UNTUK KIRIM WA";
+                        const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(waText)}`;
+                        
+                        messageResult += `\n\n📱 <b>Kirim ke WhatsApp Pelanggan:</b>\n<a href="${waUrl}">👉 KLIK DISINI UNTUK BUKA WA</a>`;
+                    } else {
+                        messageResult += `\n\n⚠️ Nomor kontak tidak valid untuk WA.`;
                     }
                 }
 
-                // C. LAPORAN DENGAN LINK HTML YANG RAPI
-                let responseText = `✅ <b>TERKIRIM KE WEB!</b> 🌐\nData untuk <code>${orderId}</code> sudah masuk database.`;
-                
-                if (linkAction) {
-                    // Syntax HTML Link: <a href="url">Teks</a>
-                    responseText += `\n\n👇 <b>Kirim ke Pelanggan:</b> \n<a href="${linkAction}">${labelAction}</a>`;
-                } else {
-                    responseText += `\n\n⚠️ Kontak tidak valid, data hanya disimpan di Web.`;
-                }
-
+                // C. Kirim Pesan Final ke Admin
                 await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         chat_id: chatId,
-                        text: responseText,
-                        parse_mode: 'HTML', // PENTING: Mode HTML agar link Email jalan
+                        text: messageResult,
+                        parse_mode: 'HTML', // Wajib HTML agar <a href> jalan
                         disable_web_page_preview: true
                     })
                 });
 
-            } catch (e) { console.error("DB Error:", e); }
+            } catch (e) { 
+                await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+                    method: 'POST', headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ chat_id: chatId, text: `❌ Error: ${e.message}` })
+                });
+            }
         }
     }
   }
