@@ -1,149 +1,76 @@
-import admin from 'firebase-admin';
-
-// --- INIT FIREBASE ---
-if (!admin.apps.length) {
-  try {
-    const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
-    if (raw) {
-      const serviceAccount = JSON.parse(raw);
-      if (serviceAccount.private_key) {
-        serviceAccount.private_key = serviceAccount.private_key.replace(/\\n/g, '\n');
-      }
-      admin.initializeApp({ credential: admin.credential.cert(serviceAccount) });
-    }
-  } catch (e) { console.error("Firebase Error:", e.message); }
-}
-const db = admin.apps.length ? admin.firestore() : null;
-
 export default async function handler(req, res) {
+  res.setHeader('Access-Control-Allow-Credentials', true);
+  res.setHeader('Access-Control-Allow-Origin', '*'); 
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+
+  if (req.method === 'OPTIONS') { res.status(200).end(); return; }
+  if (req.method !== 'POST') return res.status(405).json({ error: 'Method Not Allowed' });
+
   const token = process.env.TELEGRAM_BOT_TOKEN;
-  
-  if (!db) return res.status(500).json({ error: "Database Error" });
+  const chatId = process.env.TELEGRAM_ADMIN_ID;
 
-  // 1. HANDLE TOMBOL ACC
-  if (req.body.callback_query) {
-    const callback = req.body.callback_query;
-    const data = callback.data; 
-    const chatId = callback.message.chat.id;
-    const messageId = callback.message.message_id;
+  if (!token || !chatId) return res.status(500).json({ error: 'Env Var Missing' });
 
-    if (data.startsWith('ACC')) {
-      const separator = data.includes('|') ? '|' : '_';
-      const parts = data.split(separator);
-      const orderId = parts[1];
-      const contactInfo = parts.slice(2).join(separator); 
+  // --- AMBIL DATA ---
+  // type: 'manual', 'auto', atau 'complaint'
+  // message: Isi pesan komplain dari user
+  const { orderId, total, items, buyerContact, type = 'manual', message = '' } = req.body;
 
-      try {
-        await db.collection('orders').doc(orderId).update({ status: 'paid' });
+  // Cari Kontak
+  let contactInfo = "-";
+  if (buyerContact) contactInfo = buyerContact;
+  else if (items?.[0]?.data?.[0]) contactInfo = items[0].data[0];
 
-        // Update Pesan Lama
-        await fetch(`https://api.telegram.org/bot${token}/editMessageText`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            message_id: messageId,
-            text: `✅ <b>PROSES DATA INPUT</b>\n🆔 Order: <code>${orderId}</code>\n👤 Kontak: <b>${contactInfo}</b>\n\n<i>Silahkan balas pesan di bawah ini...</i> 👇`,
-            parse_mode: 'HTML'
-          })
-        });
+  // --- LOGIKA JUDUL & TOMBOL ---
+  let title = "";
+  let bodyText = "";
+  let buttons = [];
 
-        // Prompt Force Reply
-        await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
-            chat_id: chatId,
-            text: `📝 <b>INPUT DATA PRODUK</b>\n\nSilahkan balas pesan ini dengan data (Akun/Voucher) untuk:\nOrder ID: #${orderId}\nBuyer: ${contactInfo}`,
-            parse_mode: 'HTML',
-            reply_markup: {
-              force_reply: true,
-              input_field_placeholder: "Paste data akun disini..."
-            }
-          })
-        });
+  if (type === 'complaint') {
+      // --- LOGIKA KOMPLAIN ---
+      title = "⚠️ *ADA KOMPLAIN MASUK!*";
+      bodyText = `🗣️ *Keluhan User:*\n"${message}"\n\n👇 Segera cek dan balas solusi di bawah.`;
+      
+      buttons = [[
+          // Tombol Khusus Komplain (Format: COMPLAIN|ID|KONTAK)
+          { text: "💬 BALAS KOMPLAIN", callback_data: `COMPLAIN|${orderId}|${contactInfo}` }
+      ]];
+  } else {
+      // --- LOGIKA ORDER BARU (MANUAL/AUTO) ---
+      title = type === 'auto' ? "💰 *LUNAS (MIDTRANS)*" : "🔔 *CEK MUTASI (MANUAL)*";
+      const itemList = items ? items.map(i => `- ${i.name} (x${i.qty})`).join('\n') : '-';
+      
+      bodyText = `📦 *Item:*\n${itemList}\n\n👇 *AKSI ADMIN:*`;
+      
+      buttons = [[
+          { text: type === 'auto' ? "🚀 ISI DATA" : "✅ ACC & ISI DATA", callback_data: `ACC|${orderId}|${contactInfo}` }
+      ]];
+  }
 
-      } catch (e) { console.error("Webhook Error:", e); }
-    }
-    
-    await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify({ callback_query_id: callback.id }) 
+  const text = `
+${title}
+--------------------------------
+🆔 \`${orderId}\`
+💰 *Rp ${parseInt(total || 0).toLocaleString()}*
+👤 *Kontak:* \`${contactInfo}\`
+
+${bodyText}
+  `.trim();
+
+  try {
+    await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text: text,
+        parse_mode: 'Markdown',
+        reply_markup: { inline_keyboard: buttons }
+      })
     });
+    return res.status(200).json({ success: true });
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
   }
-
-  // 2. HANDLE BALASAN ADMIN (LOGIKA LINK GMAIL + COPY)
-  else if (req.body.message && req.body.message.reply_to_message) {
-    const msg = req.body.message;
-    const replyText = msg.reply_to_message.text;
-    const adminContent = msg.text; 
-    const chatId = msg.chat.id;
-
-    if (replyText.includes("INPUT DATA PRODUK") && replyText.includes("Order ID: #")) {
-        
-        const orderIdMatch = replyText.match(/Order ID: #([^\s]+)/);
-        const buyerMatch = replyText.match(/Buyer: (.*)/);
-        
-        const orderId = orderIdMatch ? orderIdMatch[1] : null;
-        let contactInfo = buyerMatch ? buyerMatch[1].trim() : "";
-
-        if (orderId && adminContent) {
-            try {
-                // A. Update Database
-                await db.collection('orders').doc(orderId).update({
-                    adminMessage: adminContent,
-                    status: 'paid'
-                });
-
-                // B. SIAPKAN PESAN HASIL
-                let messageResult = `✅ <b>DATA TERKIRIM KE WEB!</b> 🌐\nData untuk <code>${orderId}</code> sudah aman.\n\n`;
-                
-                // --- FITUR BARU: DATA DALAM KOTAK COPY ---
-                // Tag <pre> membuat teks bisa dicopy dengan satu klik di Telegram
-                messageResult += `📦 <b>DATA PRODUK (Tap untuk Copy):</b>\n<pre>${adminContent}</pre>\n\n`;
-
-                // C. GENERATE LINK OTOMATIS
-                if (contactInfo.includes("@")) {
-                    // --- OPSI EMAIL (GMAIL LINK) ---
-                    // Kita pakai Link HTTPS Gmail agar PASTI DIBACA sebagai link oleh Telegram
-                    const subject = `Pesanan Anda: ${orderId}`;
-                    const body = `Halo,\n\nBerikut data pesanan Anda (${orderId}):\n\n${adminContent}\n\nTerima kasih!`;
-                    
-                    const gmailLink = `https://mail.google.com/mail/?view=cm&fs=1&to=${contactInfo}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
-                    
-                    messageResult += `📧 <b>KIRIM KE PELANGGAN:</b>\n<a href="${gmailLink}">👉 KLIK DISINI (Buka Gmail Otomatis)</a>`;
-
-                } else {
-                    // --- OPSI WHATSAPP ---
-                    let phone = contactInfo.replace(/[^0-9]/g, '');
-                    if (phone.startsWith("08")) phone = "62" + phone.slice(1);
-                    
-                    if (phone.length > 5) {
-                        const waText = `Halo, pesanan *${orderId}* sudah selesai!\n\n*DATA PESANAN:*\n${adminContent}\n\nTerima kasih!`;
-                        const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(waText)}`;
-                        
-                        messageResult += `📱 <b>KIRIM KE WHATSAPP:</b>\n<a href="${waUrl}">👉 KLIK DISINI (Buka WA Otomatis)</a>`;
-                    } else {
-                        messageResult += `⚠️ Nomor WA tidak valid.`;
-                    }
-                }
-
-                // Kirim Pesan Final
-                await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/json' },
-                    body: JSON.stringify({
-                        chat_id: chatId,
-                        text: messageResult,
-                        parse_mode: 'HTML',
-                        disable_web_page_preview: true
-                    })
-                });
-
-            } catch (e) { console.error(e); }
-        }
-    }
-  }
-
-  return res.status(200).send('OK');
 }
