@@ -1,6 +1,6 @@
 import admin from 'firebase-admin';
 
-// --- 1. INIT FIREBASE (Auto-Fix Key Vercel) ---
+// --- INIT FIREBASE ---
 if (!admin.apps.length) {
   try {
     const raw = process.env.FIREBASE_SERVICE_ACCOUNT;
@@ -20,7 +20,7 @@ export default async function handler(req, res) {
   
   if (!db) return res.status(500).json({ error: "Database Error" });
 
-  // --- 2. HANDLE TOMBOL ACC (CALLBACK QUERY) ---
+  // 1. HANDLE TOMBOL ACC
   if (req.body.callback_query) {
     const callback = req.body.callback_query;
     const data = callback.data; 
@@ -43,12 +43,12 @@ export default async function handler(req, res) {
           body: JSON.stringify({
             chat_id: chatId,
             message_id: messageId,
-            text: `✅ <b>PEMBAYARAN DITERIMA</b>\n🆔 Order: <code>${orderId}</code>\n👤 Kontak: <b>${contactInfo}</b>\n\n<i>Silahkan balas pesan di bawah ini untuk isi data...</i> 👇`,
+            text: `✅ <b>PROSES DATA INPUT</b>\n🆔 Order: <code>${orderId}</code>\n👤 Kontak: <b>${contactInfo}</b>\n\n<i>Silahkan balas pesan di bawah ini...</i> 👇`,
             parse_mode: 'HTML'
           })
         });
 
-        // Kirim Pesan Force Reply
+        // Prompt Force Reply
         await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
@@ -63,17 +63,16 @@ export default async function handler(req, res) {
           })
         });
 
-      } catch (e) { console.error("Webhook ACC Error:", e); }
+      } catch (e) { console.error("Webhook Error:", e); }
     }
     
-    // Hapus loading
     await fetch(`https://api.telegram.org/bot${token}/answerCallbackQuery`, {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({ callback_query_id: callback.id }) 
     });
   }
 
-  // --- 3. HANDLE BALASAN ADMIN (LOGIKA LINK POWERFULL) ---
+  // 2. HANDLE BALASAN ADMIN (LOGIKA LINK GMAIL + COPY)
   else if (req.body.message && req.body.message.reply_to_message) {
     const msg = req.body.message;
     const replyText = msg.reply_to_message.text;
@@ -96,25 +95,26 @@ export default async function handler(req, res) {
                     status: 'paid'
                 });
 
-                // B. GENERATE LINK (HTML STRICT MODE)
-                let messageResult = `✅ <b>DATA TERKIRIM KE WEB!</b> 🌐\nData untuk <code>${orderId}</code> sudah masuk database.`;
+                // B. SIAPKAN PESAN HASIL
+                let messageResult = `✅ <b>DATA TERKIRIM KE WEB!</b> 🌐\nData untuk <code>${orderId}</code> sudah aman.\n\n`;
                 
-                // Cek Tipe Kontak
+                // --- FITUR BARU: DATA DALAM KOTAK COPY ---
+                // Tag <pre> membuat teks bisa dicopy dengan satu klik di Telegram
+                messageResult += `📦 <b>DATA PRODUK (Tap untuk Copy):</b>\n<pre>${adminContent}</pre>\n\n`;
+
+                // C. GENERATE LINK OTOMATIS
                 if (contactInfo.includes("@")) {
-                    // --- MODE EMAIL ---
-                    const subject = `Pesanan Jisaeshin: ${orderId}`;
-                    // Tips: Email butuh \r\n untuk baris baru
-                    const body = `Halo,\n\nBerikut data pesanan Anda (${orderId}):\n\n${adminContent}\n\nTerima kasih!`.replace(/\n/g, "\r\n");
+                    // --- OPSI EMAIL (GMAIL LINK) ---
+                    // Kita pakai Link HTTPS Gmail agar PASTI DIBACA sebagai link oleh Telegram
+                    const subject = `Pesanan Anda: ${orderId}`;
+                    const body = `Halo,\n\nBerikut data pesanan Anda (${orderId}):\n\n${adminContent}\n\nTerima kasih!`;
                     
-                    // RAKIT LINK MAILTO DENGAN BENAR
-                    const mailtoUrl = `mailto:${contactInfo}?subject=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
+                    const gmailLink = `https://mail.google.com/mail/?view=cm&fs=1&to=${contactInfo}&su=${encodeURIComponent(subject)}&body=${encodeURIComponent(body)}`;
                     
-                    // Masukkan ke Tag HTML
-                    messageResult += `\n\n📧 <b>Kirim ke Email Pelanggan:</b>\n<a href="${mailtoUrl}">👉 KLIK DISINI UNTUK BUKA GMAIL</a>`;
-                    messageResult += `\n\n<i>(Jika link tidak bisa diklik, copy email ini: <code>${contactInfo}</code>)</i>`;
+                    messageResult += `📧 <b>KIRIM KE PELANGGAN:</b>\n<a href="${gmailLink}">👉 KLIK DISINI (Buka Gmail Otomatis)</a>`;
 
                 } else {
-                    // --- MODE WHATSAPP ---
+                    // --- OPSI WHATSAPP ---
                     let phone = contactInfo.replace(/[^0-9]/g, '');
                     if (phone.startsWith("08")) phone = "62" + phone.slice(1);
                     
@@ -122,30 +122,25 @@ export default async function handler(req, res) {
                         const waText = `Halo, pesanan *${orderId}* sudah selesai!\n\n*DATA PESANAN:*\n${adminContent}\n\nTerima kasih!`;
                         const waUrl = `https://wa.me/${phone}?text=${encodeURIComponent(waText)}`;
                         
-                        messageResult += `\n\n📱 <b>Kirim ke WhatsApp Pelanggan:</b>\n<a href="${waUrl}">👉 KLIK DISINI UNTUK BUKA WA</a>`;
+                        messageResult += `📱 <b>KIRIM KE WHATSAPP:</b>\n<a href="${waUrl}">👉 KLIK DISINI (Buka WA Otomatis)</a>`;
                     } else {
-                        messageResult += `\n\n⚠️ Nomor kontak tidak valid untuk WA.`;
+                        messageResult += `⚠️ Nomor WA tidak valid.`;
                     }
                 }
 
-                // C. Kirim Pesan Final ke Admin
+                // Kirim Pesan Final
                 await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({
                         chat_id: chatId,
                         text: messageResult,
-                        parse_mode: 'HTML', // Wajib HTML agar <a href> jalan
+                        parse_mode: 'HTML',
                         disable_web_page_preview: true
                     })
                 });
 
-            } catch (e) { 
-                await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
-                    method: 'POST', headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify({ chat_id: chatId, text: `❌ Error: ${e.message}` })
-                });
-            }
+            } catch (e) { console.error(e); }
         }
     }
   }
