@@ -1,65 +1,88 @@
-// file: api/notify.js
 const { Telegraf } = require('telegraf');
+// Pastikan token bot disimpan di Environment Variable Vercel dengan nama TELEGRAM_BOT_TOKEN
+// Dan ID Admin di TELEGRAM_ADMIN_ID
+const bot = new Telegraf(process.env.TELEGRAM_BOT_TOKEN);
 
-// Pastikan Token & Admin ID ada di .env
-const bot = new Telegraf(process.env.BOT_TOKEN);
-const ADMIN_ID = process.env.ADMIN_ID; 
-
-module.exports = async (req, res) => {
-    // CORS
+// Wrapper CORS agar aman dipanggil dari Frontend
+const allowCors = (fn) => async (req, res) => {
+    res.setHeader('Access-Control-Allow-Credentials', true);
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,POST,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+        res.status(200).end();
+        return;
+    }
+    return await fn(req, res);
+};
 
-    if (req.method === 'OPTIONS') return res.status(200).end();
+const handler = async (req, res) => {
+    if (req.method !== 'POST') return res.status(405).end();
 
     try {
-        // Ambil data yang dikirim dari Frontend saat onSuccess
         const { orderId, total, items, buyerContact, type } = req.body;
+        const adminId = process.env.TELEGRAM_ADMIN_ID; // ID Telegram Admin kamu
 
-        // --- 1. SUSUN PESAN LAPORAN KE ADMIN ---
-        let message = `✅ <b>PEMBAYARAN SUKSES (AUTO)</b>\n\n`;
-        message += `🆔 Order ID: <code>${orderId}</code>\n`;
-        message += `💰 Total: Rp ${parseInt(total).toLocaleString('id-ID')}\n`;
-        message += `👤 Kontak: ${buyerContact}\n\n`;
+        let message = "";
+        let keyboard = null;
+
+        // --- FORMAT PESAN ITEM ---
+        const itemsList = items.map((i, idx) => 
+            `${idx + 1}. ${i.name} x${i.qty}`
+        ).join('\n');
+
+        // ==========================================
+        // SKENARIO 1: MANUAL (Order Baru Masuk)
+        // ==========================================
+        if (type === 'manual') {
+            message = `⚡ *ORDER BARU (MANUAL)*\n` +
+                      `🆔 \`${orderId}\`\n\n` +
+                      `💰 Rp ${parseInt(total).toLocaleString('id-ID')}\n` +
+                      `👤 ${buyerContact}\n\n` +
+                      `🛒 *Item Dibeli:*\n${itemsList}\n\n` +
+                      `_Segera cek mutasi bank/e-wallet. Klik tombol di bawah jika dana sudah masuk._`;
+            
+            // Tombol "Acc Admin" (Callback Data: acc_ORDERID)
+            keyboard = {
+                inline_keyboard: [
+                    [
+                        { text: "✅ ACC ADMIN / PROSES", callback_data: `acc_${orderId}` }
+                    ]
+                ]
+            };
+        } 
         
-        message += `🛒 <b>Item Dibeli:</b>\n`;
-        let contentToSend = ""; // Menampung konten (akun/kode) untuk user
-
-        items.forEach((item, index) => {
-            // Abaikan Voucher di list tampilan
-            if(item.name.startsWith("VOUCHER")) return; 
-
-            message += `${index+1}. ${item.name} x${item.qty}\n`;
+        // ==========================================
+        // SKENARIO 2: AUTO (Pembayaran Sukses via Midtrans)
+        // ==========================================
+        else {
+            message = `✅ *PEMBAYARAN SUKSES (AUTO)*\n` +
+                      `🆔 Order ID: \`${orderId}\`\n\n` +
+                      `💰 Total: Rp ${parseInt(total).toLocaleString('id-ID')}\n` +
+                      `👤 Kontak: ${buyerContact}\n\n` +
+                      `🛒 *Item Dibeli:*\n${itemsList}\n\n` +
+                      `_Stok otomatis terpotong (jika tersedia). Cek dashboard untuk detail._`;
             
-            // Cek apakah ada data rahasia (akun/kode) di dalam item note/data
-            // Di kode frontend Anda: data: c.note ? [c.note] : []
-            if (item.data && item.data.length > 0) {
-                message += `   <i>Data: ${item.data.join(', ')}</i>\n`;
-                contentToSend += `📦 <b>${item.name}</b>:\n<code>${item.data.join('\n')}</code>\n\n`;
-            } else {
-                // Jika tidak ada data otomatis, beri tanda harus proses manual
-                message += `   ℹ️ <i>(Butuh Proses Manual / Stok Fisik)</i>\n`;
-            }
-        });
-
-        message += `\n<i>Mohon cek Dashboard Midtrans untuk detail mutasi.</i>`;
-
-        // --- 2. KIRIM KE TELEGRAM ADMIN ---
-        if (ADMIN_ID) {
-            await bot.telegram.sendMessage(ADMIN_ID, message, { parse_mode: 'HTML' });
-            
-            // --- 3. (OPSIONAL) KIRIM KONTEN KE ADMIN JUGA SUPAYA GAMPANG COPAS ---
-            if (contentToSend) {
-                 await bot.telegram.sendMessage(ADMIN_ID, "👇 <b>KONTEN PESANAN UNTUK BUYER:</b>\n\n" + contentToSend, { parse_mode: 'HTML' });
-            }
+            // Auto biasanya tidak butuh tombol ACC, tapi bisa ditambah tombol cek
+            keyboard = {
+                inline_keyboard: [
+                    [{ text: "🔍 Cek Detail", callback_data: `cek_${orderId}` }]
+                ]
+            };
         }
 
-        // --- 4. SUKSES ---
+        // KIRIM KE TELEGRAM
+        await bot.telegram.sendMessage(adminId, message, {
+            parse_mode: 'Markdown',
+            reply_markup: keyboard
+        });
+
         res.status(200).json({ status: 'Notification Sent' });
 
-    } catch (e) {
-        console.error("Notify Error:", e);
-        res.status(500).json({ error: "Gagal kirim notifikasi" });
+    } catch (error) {
+        console.error("Telegram Error:", error);
+        res.status(500).json({ error: error.message });
     }
 };
+
+module.exports = allowCors(handler);
