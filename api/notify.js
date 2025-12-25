@@ -1,5 +1,6 @@
 const bot = require('../lib/botConfig');
 
+// Wrapper CORS
 const allowCors = (fn) => async (req, res) => {
     res.setHeader('Access-Control-Allow-Credentials', true);
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -16,25 +17,25 @@ const handler = async (req, res) => {
         const { orderId, total, items, buyerContact, type } = req.body;
         const adminId = process.env.ADMIN_ID; 
 
-        if (!adminId) return res.status(500).json({ error: "ADMIN_ID missing" });
+        if (!adminId) return res.status(500).json({ error: "ADMIN_ID missing in Vercel" });
 
         const itemsList = items.map((i, idx) => `${idx + 1}. ${i.name} x${i.qty}`).join('\n');
         
         let message = "";
         let buttonText = "";
 
-        // ALUR DISAMAKAN SESUAI REQUEST
+        // ALUR HYBRID: KEDUANYA BUTUH PROSES BOT
         if (type === 'manual') {
             message = `⚡ *ORDER BARU (MANUAL)*\n` +
                       `🆔 \`${orderId}\`\n💰 Rp ${parseInt(total).toLocaleString()}\n` +
                       `👤 ${buyerContact}\n\n🛒 *Items:*\n${itemsList}\n\n` +
-                      `_User konfirmasi sudah bayar. Klik tombol di bawah untuk cek stok & proses._`;
+                      `_User konfirmasi sudah transfer. Klik tombol untuk Cek Stok & Proses._`;
             buttonText = "✅ ACC / PROSES DATA";
         } else {
             message = `✅ *PEMBAYARAN LUNAS (AUTO)*\n` +
                       `🆔 \`${orderId}\`\n💰 Rp ${parseInt(total).toLocaleString()}\n` +
                       `👤 ${buyerContact}\n\n🛒 *Items:*\n${itemsList}\n\n` +
-                      `_Pembayaran Midtrans sukses. Klik tombol untuk alokasi data._`;
+                      `_Midtrans sukses. Klik tombol untuk Cek Stok & Alokasi Data._`;
              buttonText = "🔍 PROSES / CEK STOK";
         }
 
