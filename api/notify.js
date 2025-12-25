@@ -14,42 +14,35 @@ const handler = async (req, res) => {
 
     try {
         const { orderId, total, items, buyerContact, type } = req.body;
-        
-        // --- PERBAIKAN DI SINI ---
-        // Menggunakan variabel generic ADMIN_ID. 
-        // Jika ini kosong di Vercel, maka error chat_id empty muncul lagi.
         const adminId = process.env.ADMIN_ID; 
 
-        if (!adminId) {
-            console.error("ADMIN_ID belum di-set di Vercel!");
-            return res.status(500).json({ error: "Server Configuration Error: ADMIN_ID missing" });
-        }
+        if (!adminId) return res.status(500).json({ error: "ADMIN_ID missing" });
 
         const itemsList = items.map((i, idx) => `${idx + 1}. ${i.name} x${i.qty}`).join('\n');
         
         let message = "";
-        let keyboard = null;
+        let buttonText = "";
 
+        // ALUR DISAMAKAN SESUAI REQUEST
         if (type === 'manual') {
             message = `⚡ *ORDER BARU (MANUAL)*\n` +
                       `🆔 \`${orderId}\`\n💰 Rp ${parseInt(total).toLocaleString()}\n` +
                       `👤 ${buyerContact}\n\n🛒 *Items:*\n${itemsList}\n\n` +
-                      `_Segera cek mutasi. Klik ACC jika dana masuk._`;
-            
-            keyboard = {
-                inline_keyboard: [[{ text: "✅ ACC ADMIN / PROSES", callback_data: `acc_${orderId}` }]]
-            };
-
+                      `_User konfirmasi sudah bayar. Klik tombol di bawah untuk cek stok & proses._`;
+            buttonText = "✅ ACC / PROSES DATA";
         } else {
-            message = `✅ *PEMBAYARAN SUKSES (AUTO)*\n` +
+            message = `✅ *PEMBAYARAN LUNAS (AUTO)*\n` +
                       `🆔 \`${orderId}\`\n💰 Rp ${parseInt(total).toLocaleString()}\n` +
                       `👤 ${buyerContact}\n\n🛒 *Items:*\n${itemsList}\n\n` +
-                      `_Stok otomatis terpotong._`;
+                      `_Pembayaran Midtrans sukses. Klik tombol untuk alokasi data._`;
+             buttonText = "🔍 PROSES / CEK STOK";
         }
 
         await bot.telegram.sendMessage(adminId, message, {
             parse_mode: 'Markdown',
-            reply_markup: keyboard
+            reply_markup: {
+                inline_keyboard: [[{ text: buttonText, callback_data: `acc_${orderId}` }]]
+            }
         });
 
         res.status(200).json({ status: 'ok' });
