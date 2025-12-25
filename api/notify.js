@@ -1,66 +1,65 @@
-const { bot } = require('../lib/botConfig');
-const { db } = require('../lib/firebaseConfig'); // Opsional jika mau update DB di sini
-const NOTIF_CHAT_ID = process.env.ADMIN_ID; 
+// file: api/notify.js
+const { Telegraf } = require('telegraf');
+
+// Pastikan Token & Admin ID ada di .env
+const bot = new Telegraf(process.env.BOT_TOKEN);
+const ADMIN_ID = process.env.ADMIN_ID; 
 
 module.exports = async (req, res) => {
     // CORS
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
     if (req.method === 'OPTIONS') return res.status(200).end();
 
     try {
-        const body = req.body;
+        // Ambil data yang dikirim dari Frontend saat onSuccess
+        const { orderId, total, items, buyerContact, type } = req.body;
 
-        // --- A. JIKA DARI MIDTRANS (Webhook Pembayaran) ---
-        if (body.transaction_status) {
-            const orderId = body.order_id;
-            const status = body.transaction_status;
+        // --- 1. SUSUN PESAN LAPORAN KE ADMIN ---
+        let message = `✅ <b>PEMBAYARAN SUKSES (AUTO)</b>\n\n`;
+        message += `🆔 Order ID: <code>${orderId}</code>\n`;
+        message += `💰 Total: Rp ${parseInt(total).toLocaleString('id-ID')}\n`;
+        message += `👤 Kontak: ${buyerContact}\n\n`;
+        
+        message += `🛒 <b>Item Dibeli:</b>\n`;
+        let contentToSend = ""; // Menampung konten (akun/kode) untuk user
+
+        items.forEach((item, index) => {
+            // Abaikan Voucher di list tampilan
+            if(item.name.startsWith("VOUCHER")) return; 
+
+            message += `${index+1}. ${item.name} x${item.qty}\n`;
             
-            // Jika sukses bayar
-            if (status === 'capture' || status === 'settlement') {
-                // Update DB jadi PAID
-                await db.collection('orders').doc(orderId).update({ 
-                    status: 'paid',
-                    paymentMethod: 'MIDTRANS'
-                });
-                
-                // Kirim notif ke Admin (Opsional: Trigger VIP disini kalau mau Auto-Instant)
-                // Untuk sekarang kita notif saja, admin bisa klik ACC untuk proses VIP
-                await bot.telegram.sendMessage(NOTIF_CHAT_ID, 
-                    `💰 <b>PEMBAYARAN DITERIMA (MIDTRANS)</b>\n🆔 ${orderId}\nStatus: PAID\n\n👇 Klik untuk proses item:`, 
-                    {
-                        parse_mode: 'HTML',
-                        reply_markup: { inline_keyboard: [[{ text: "🚀 PROSES ORDER", callback_data: `acc_${orderId}` }]] }
-                    }
-                );
+            // Cek apakah ada data rahasia (akun/kode) di dalam item note/data
+            // Di kode frontend Anda: data: c.note ? [c.note] : []
+            if (item.data && item.data.length > 0) {
+                message += `   <i>Data: ${item.data.join(', ')}</i>\n`;
+                contentToSend += `📦 <b>${item.name}</b>:\n<code>${item.data.join('\n')}</code>\n\n`;
+            } else {
+                // Jika tidak ada data otomatis, beri tanda harus proses manual
+                message += `   ℹ️ <i>(Butuh Proses Manual / Stok Fisik)</i>\n`;
             }
-            return res.status(200).send('OK');
+        });
+
+        message += `\n<i>Mohon cek Dashboard Midtrans untuk detail mutasi.</i>`;
+
+        // --- 2. KIRIM KE TELEGRAM ADMIN ---
+        if (ADMIN_ID) {
+            await bot.telegram.sendMessage(ADMIN_ID, message, { parse_mode: 'HTML' });
+            
+            // --- 3. (OPSIONAL) KIRIM KONTEN KE ADMIN JUGA SUPAYA GAMPANG COPAS ---
+            if (contentToSend) {
+                 await bot.telegram.sendMessage(ADMIN_ID, "👇 <b>KONTEN PESANAN UNTUK BUYER:</b>\n\n" + contentToSend, { parse_mode: 'HTML' });
+            }
         }
 
-        // --- B. JIKA DARI FRONTEND (Manual Order / Komplain) ---
-        const { orderId, total, items, type, buyerContact, message } = body;
-        const safeId = String(orderId).substring(0, 50);
-
-        if (type === 'complaint') {
-            await bot.telegram.sendMessage(NOTIF_CHAT_ID, 
-                `🚨 <b>KOMPLAIN USER</b>\n🆔 ${safeId}\n👤 ${buyerContact}\n💬 "${message}"`, 
-                { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: "↩️ BALAS", callback_data: `reply_complain_${safeId}` }]] } }
-            );
-        } 
-        else {
-            // Notifikasi Order Baru (Manual)
-            let msg = `⚡ <b>ORDER BARU (MANUAL)</b>\n🆔 <code>${safeId}</code>\n💰 Rp ${parseInt(total).toLocaleString()}\n👤 ${buyerContact}`;
-            await bot.telegram.sendMessage(NOTIF_CHAT_ID, msg, {
-                parse_mode: 'HTML',
-                reply_markup: { inline_keyboard: [[{ text: "✅ ACC SEKARANG", callback_data: `acc_${safeId}` }]] }
-            });
-        }
-
-        res.status(200).json({ success: true });
+        // --- 4. SUKSES ---
+        res.status(200).json({ status: 'Notification Sent' });
 
     } catch (e) {
-        console.error(e);
-        res.status(500).json({ error: e.message });
+        console.error("Notify Error:", e);
+        res.status(500).json({ error: "Gagal kirim notifikasi" });
     }
 };
