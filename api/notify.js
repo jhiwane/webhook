@@ -1,6 +1,5 @@
-const bot = require('../lib/botConfig'); // Import bot yang sudah dicoding di atas
+const bot = require('../lib/botConfig');
 
-// Wrapper CORS
 const allowCors = (fn) => async (req, res) => {
     res.setHeader('Access-Control-Allow-Credentials', true);
     res.setHeader('Access-Control-Allow-Origin', '*');
@@ -15,18 +14,23 @@ const handler = async (req, res) => {
 
     try {
         const { orderId, total, items, buyerContact, type } = req.body;
-        const adminId = process.env.TELEGRAM_ADMIN_ID;
+        
+        // --- PERBAIKAN DI SINI ---
+        // Menggunakan variabel generic ADMIN_ID. 
+        // Jika ini kosong di Vercel, maka error chat_id empty muncul lagi.
+        const adminId = process.env.ADMIN_ID; 
 
-        // Format List Item
+        if (!adminId) {
+            console.error("ADMIN_ID belum di-set di Vercel!");
+            return res.status(500).json({ error: "Server Configuration Error: ADMIN_ID missing" });
+        }
+
         const itemsList = items.map((i, idx) => `${idx + 1}. ${i.name} x${i.qty}`).join('\n');
         
         let message = "";
         let keyboard = null;
 
-        // --- LOGIC PEMISAH (MANUAL vs AUTO) ---
-
         if (type === 'manual') {
-            // SKENARIO MANUAL: Ada tombol ACC
             message = `⚡ *ORDER BARU (MANUAL)*\n` +
                       `🆔 \`${orderId}\`\n💰 Rp ${parseInt(total).toLocaleString()}\n` +
                       `👤 ${buyerContact}\n\n🛒 *Items:*\n${itemsList}\n\n` +
@@ -37,15 +41,12 @@ const handler = async (req, res) => {
             };
 
         } else {
-            // SKENARIO AUTO (Midtrans): Info saja
             message = `✅ *PEMBAYARAN SUKSES (AUTO)*\n` +
                       `🆔 \`${orderId}\`\n💰 Rp ${parseInt(total).toLocaleString()}\n` +
                       `👤 ${buyerContact}\n\n🛒 *Items:*\n${itemsList}\n\n` +
                       `_Stok otomatis terpotong._`;
-             // Tidak perlu tombol ACC karena sudah lunas otomatis
         }
 
-        // Kirim ke Telegram
         await bot.telegram.sendMessage(adminId, message, {
             parse_mode: 'Markdown',
             reply_markup: keyboard
