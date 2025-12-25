@@ -1,52 +1,65 @@
+// file: api/token.js
 const midtransClient = require('midtrans-client');
 
 module.exports = async (req, res) => {
-    // --- AREA WAJIB (JANGAN DIUBAH) ---
-    // Header ini mengizinkan frontend manapun untuk masuk tanpa error "CORS"
+    // CORS (Agar frontend bisa akses)
     res.setHeader('Access-Control-Allow-Credentials', true);
-    res.setHeader('Access-Control-Allow-Origin', '*'); // '*' artinya semua boleh masuk
-    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST,OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
-    // Jika browser "bertanya" dulu (Preflight), langsung jawab OK
-    if (req.method === 'OPTIONS') {
-        res.status(200).end();
-        return;
-    }
-    // ----------------------------------
+    if (req.method === 'OPTIONS') return res.status(200).end();
 
     try {
-        // Setup Midtrans
-        const snap = new midtransClient.Snap({
-            isProduction: true,
+        const { order_id, total, items } = req.body;
+
+        // --- 1. SETUP MIDTRANS ---
+        let snap = new midtransClient.Snap({
+            isProduction: true, // Pastikan true
             serverKey: process.env.MIDTRANS_SERVER_KEY,
             clientKey: process.env.MIDTRANS_CLIENT_KEY
         });
 
-        const { order_id, total, items, customer_details } = req.body;
+        // --- 2. BERSIHKAN ITEM (PENTING!) ---
+        // Frontend Anda mengirim field 'processType', 'serverRoute', dll.
+        // Midtrans AKAN ERROR jika menerima field itu. Kita harus memfilter cuma ambil id, price, quantity, name.
+        const cleanItems = items.map((item) => {
+            // Jika item itu voucher (harga negatif), biarkan
+            if (item.price < 0) {
+                return {
+                    id: "DISCOUNT",
+                    price: parseInt(item.price),
+                    quantity: 1,
+                    name: "Diskon Voucher"
+                };
+            }
+            // Item normal
+            return {
+                id: item.name.substring(0, 50), // Midtrans max 50 char
+                price: parseInt(item.price),
+                quantity: parseInt(item.qty),
+                name: item.name.substring(0, 50)
+            };
+        });
 
-        // Validasi data tidak boleh kosong
-        if (!order_id || !total) {
-            return res.status(400).json({ error: "Data order_id atau total kosong" });
-        }
-
-        const parameter = {
+        // --- 3. BUAT PARAMETER ---
+        let parameter = {
             transaction_details: {
                 order_id: order_id,
                 gross_amount: parseInt(total)
             },
             credit_card: { secure: true },
-            item_details: items, // Pastikan format items dari frontend sudah benar
-            customer_details: customer_details
+            item_details: cleanItems
         };
 
+        // --- 4. MINTA TOKEN ---
         const transaction = await snap.createTransaction(parameter);
         
-        // Kirim Token ke Frontend
+        // Balikin token ke Frontend sesuai permintaan kode Anda
         res.status(200).json({ token: transaction.token });
 
     } catch (e) {
-        console.error("Error Backend:", e);
+        console.error("Midtrans Error:", e.message);
         res.status(500).json({ error: e.message });
     }
 };
