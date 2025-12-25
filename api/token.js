@@ -1,67 +1,67 @@
+// api/token.js
 const midtransClient = require('midtrans-client');
 
-module.exports = async (req, res) => {
-    // --- 1. SET HEADER CORS (WAJIB PALING ATAS) ---
-    // Kode ini memberi stempel "IZIN MASUK" ke browser.
-    // Tanda '*' artinya semua website boleh masuk (termasuk firebase anda).
-    res.setHeader('Access-Control-Allow-Origin', '*'); 
-    res.setHeader('Access-Control-Allow-Credentials', 'true');
-    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
-    res.setHeader('Access-Control-Allow-Headers', 'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version');
+// --- 1. SETTING MIDTRANS ---
+// Pastikan Server Key benar
+const snap = new midtransClient.Snap({
+    isProduction: false, // Ubah ke true jika sudah production
+    serverKey: process.env.MIDTRANS_SERVER_KEY || 'SB-Mid-server-xxxxxxxxx', // Masukkan Key di Environment Vercel
+    clientKey: process.env.MIDTRANS_CLIENT_KEY || 'SB-Mid-client-xxxxxxxxx'
+});
 
-    // --- 2. TANGANI PREFLIGHT REQUEST (PENTING!) ---
-    // Browser selalu kirim sinyal 'OPTIONS' dulu untuk cek ombak.
-    // Kita harus jawab '200 OK' agar browser lanjut kirim data asli.
+// --- 2. FUNGSI UTAMA HANDLER ---
+const handler = async (req, res) => {
+    // Tangani Request Utama
+    try {
+        const { order_id, total, items, customer_details } = req.body;
+
+        if (!order_id || !total) {
+            return res.status(400).json({ error: "Data order_id atau total tidak lengkap" });
+        }
+
+        const parameter = {
+            transaction_details: {
+                order_id: order_id,
+                gross_amount: total
+            },
+            credit_card: {
+                secure: true
+            },
+            item_details: items || [], // Opsional, tapi bagus ada
+            customer_details: customer_details || {}
+        };
+
+        const transaction = await snap.createTransaction(parameter);
+        
+        // Berhasil
+        return res.status(200).json({ token: transaction.token });
+
+    } catch (error) {
+        console.error("Midtrans Error:", error);
+        return res.status(500).json({ error: error.message || "Gagal membuat transaksi" });
+    }
+};
+
+// --- 3. WRAPPER CORS "ANTI GAGAL" ---
+// Ini adalah kuncinya. Function ini membungkus logic di atas agar kebal CORS.
+const allowCors = (fn) => async (req, res) => {
+    res.setHeader('Access-Control-Allow-Credentials', true);
+    res.setHeader('Access-Control-Allow-Origin', '*'); // Boleh diakses dari mana saja
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+    res.setHeader(
+        'Access-Control-Allow-Headers',
+        'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
+    );
+
+    // Jika browser cuma tanya "Boleh masuk gak?" (OPTIONS), langsung jawab "BOLEH" dan stop.
     if (req.method === 'OPTIONS') {
         res.status(200).end();
         return;
     }
 
-    // --- 3. MULAI LOGIKA MIDTRANS ---
-    try {
-        // Ambil data
-        const { order_id, total, items, customer_details } = req.body;
-
-        // Setup Midtrans
-        let snap = new midtransClient.Snap({
-            isProduction: true,
-            serverKey: process.env.MIDTRANS_SERVER_KEY,
-            clientKey: process.env.MIDTRANS_CLIENT_KEY
-        });
-
-        // Filter items agar Midtrans tidak error (buang field processType, dll)
-        // Midtrans cuma mau: id, price, quantity, name
-        const cleanItems = items ? items.map((item) => {
-            // Cek apakah ini Voucher (harga negatif)
-            const isVoucher = item.price < 0;
-            return {
-                id: isVoucher ? "DISCOUNT" : (item.id || item.name).substring(0, 50),
-                price: parseInt(item.price),
-                quantity: parseInt(item.qty),
-                name: item.name.substring(0, 50)
-            };
-        }) : [];
-
-        // Parameter Transaksi
-        let parameter = {
-            transaction_details: {
-                order_id: order_id,
-                gross_amount: parseInt(total)
-            },
-            credit_card: { secure: true },
-            item_details: cleanItems,
-            customer_details: customer_details || { first_name: "Customer" }
-        };
-
-        // Minta Token
-        const transaction = await snap.createTransaction(parameter);
-        
-        // Kirim Token ke Frontend
-        res.status(200).json({ token: transaction.token });
-
-    } catch (e) {
-        console.error("Backend Error:", e);
-        // Tetap kirim header CORS walaupun error, supaya frontend bisa baca errornya
-        res.status(500).json({ error: e.message });
-    }
+    // Jika bukan OPTIONS, jalankan logic handler di atas
+    return await fn(req, res);
 };
+
+// Export function yang sudah dibungkus
+module.exports = allowCors(handler);
